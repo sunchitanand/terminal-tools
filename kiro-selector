@@ -1,10 +1,13 @@
 #!/usr/bin/env zsh
 # kiro-selector — TUI session manager for kiro-cli
 # Uses kiro-cli's own --list-sessions for complete data (v1 + v2 + git-based)
+# Caches results for instant startup; refreshes in background after display.
 
 DB="$HOME/Library/Application Support/kiro-cli/data.sqlite3"
 HOME_DIR="$HOME"
 MAX_PER_DIR=5
+CACHE_FILE="$HOME/.cache/kiro-selector/sessions.tsv"
+CACHE_MAX_AGE=3600  # refresh if older than 1 hour
 
 C=$'\e[36m' M=$'\e[35m' G=$'\e[32m' Y=$'\e[33m' D=$'\e[90m' R=$'\e[0m' B=$'\e[1m'
 SEL=$'\e[44;97m'
@@ -26,27 +29,14 @@ proj_name() {
     esac
 }
 
-fetch_and_build() {
-    lines_text=(); lines_type=(); lines_dir=(); lines_cid=(); lines_selectable=()
-    total_lines=0
-
-    # Get running dirs
-    typeset -A running_dirs
-    local pids=$(pgrep -f "kiro-cli/bun" 2>/dev/null | tr '\n' ',')
-    if [[ -n "$pids" ]]; then
-        pids="${pids%,}"
-        while IFS= read -r cwd; do
-            [[ -n "$cwd" ]] && running_dirs[$cwd]=1
-        done < <(lsof -p "$pids" -d cwd -Fn 2>/dev/null | grep '^n/' | cut -c2-)
-    fi
-
-    # Get all unique dirs from DB
+refresh_cache() {
+    # Slow: fetches from kiro-cli in parallel, writes TSV cache
+    mkdir -p "${CACHE_FILE:h}"
     typeset -a all_dirs
     while IFS= read -r d; do
         [[ -d "$d" ]] && all_dirs+=("$d")
     done < <(sqlite3 "$DB" "SELECT DISTINCT key FROM conversations_v2" 2>/dev/null)
 
-    # Fetch sessions from all dirs in parallel using kiro-cli
     local tmpdir=$(mktemp -d)
     for d in "${all_dirs[@]}"; do
         local hash=$(echo "$d" | /sbin/md5 -q 2>/dev/null || echo "$d" | md5sum | cut -c1-8)
@@ -54,20 +44,14 @@ fetch_and_build() {
     done
     wait
 
-    # Parse all outputs with python — strip ANSI, extract sessions, build display
-    local parsed="$tmpdir/parsed.txt"
-    python3 << PYEOF > "$parsed" 2>/dev/null
+    python3 << PYEOF > "${CACHE_FILE}.tmp" 2>/dev/null
 import os, re, glob, shlex
-
 ansi_re = re.compile(r'\x1b\[[0-9;]*m')
-# Pattern: "  TIME_AGO | TITLE | MSGS | VERSION"
 session_re = re.compile(r'^\s+(\d+ \w+ ago|just now)\s+\|\s+(.*?)\s+\|\s+(\d+) msgs\s+\|\s+(v[12])\s*$')
 dir_re = re.compile(r'^Chat sessions for (.+):')
 sid_re = re.compile(r'^Chat SessionId:\s+(\S+)')
-
 home = os.path.expanduser('~')
-def short(p):
-    return '~' + p[len(home):] if p.startswith(home) else p
+def short(p): return '~' + p[len(home):] if p.startswith(home) else p
 def proj(p):
     r = p[len(home)+1:] if p.startswith(home+'/') else p
     for prefix, label in [('Documents/projects/', 'projects/'), ('Documents/code/', 'code/'),
@@ -77,72 +61,79 @@ def proj(p):
             return label + (parts[0] if prefix != 'doc-reviews' else '')
     if r.startswith('scratch'): return 'scratch'
     return r.split('/')[0]
-
-# Collect all sessions
-sessions = []  # (proj, dir_path, short_path, cid, ago, title, msgs)
+sessions = []
 for f in glob.glob('$tmpdir/*.raw'):
     text = ansi_re.sub('', open(f).read())
-    cur_dir = ''
-    cur_cid = ''
-    count = 0
+    cur_dir = cur_cid = ''; count = 0
     for line in text.split('\n'):
         m = dir_re.match(line)
-        if m:
-            cur_dir = m.group(1).strip()
-            count = 0
-            continue
+        if m: cur_dir = m.group(1).strip(); count = 0; continue
         m = sid_re.match(line)
-        if m:
-            cur_cid = m.group(1).strip()
-            continue
+        if m: cur_cid = m.group(1).strip(); continue
         m = session_re.match(line)
         if m and cur_dir and count < $MAX_PER_DIR:
-            ago, title, msgs, ver = m.group(1), m.group(2), m.group(3), m.group(4)
-            title = title.strip()[:80]
+            ago, title, msgs = m.group(1), m.group(2).strip()[:80], m.group(3)
             sessions.append((proj(cur_dir), cur_dir, short(cur_dir), cur_cid, ago, title, msgs))
             count += 1
-
-# Sort by project name, then by original order (most recent first within each dir)
 from collections import OrderedDict
 groups = OrderedDict()
 for s in sessions:
-    p = s[0]
-    if p not in groups:
-        groups[p] = []
-    groups[p].append(s)
-
+    groups.setdefault(s[0], []).append(s)
 for p in sorted(groups.keys()):
     print(f"H\t{p}")
     prev_dir = ''
-    for proj, dir_path, short_path, cid, ago, title, msgs in groups[p]:
-        if short_path != prev_dir:
-            print(f"D\t{short_path}")
-            prev_dir = short_path
+    for _, dir_path, short_path, cid, ago, title, msgs in groups[p]:
+        if short_path != prev_dir: print(f"D\t{short_path}"); prev_dir = short_path
         print(f"S\t{shlex.quote(title)}\t{shlex.quote(dir_path)}\t{shlex.quote(cid)}\t{ago}\t{msgs}")
 PYEOF
+    mv "${CACHE_FILE}.tmp" "$CACHE_FILE" 2>/dev/null
+    rm -rf "$tmpdir"
+}
 
-    # Parse into display arrays
+build_from_cache() {
+    # Fast: reads TSV cache into display arrays
+    lines_text=(); lines_type=(); lines_dir=(); lines_cid=(); lines_selectable=()
+    total_lines=0
+
+    typeset -A running_dirs
+    local pids=$(pgrep -f "kiro-cli/bun" 2>/dev/null | tr '\n' ',')
+    if [[ -n "$pids" ]]; then
+        pids="${pids%,}"
+        while IFS= read -r cwd; do
+            [[ -n "$cwd" ]] && running_dirs[$cwd]=1
+        done < <(lsof -p "$pids" -d cwd -Fn 2>/dev/null | grep '^n/' | cut -c2-)
+    fi
+
+    [[ ! -f "$CACHE_FILE" ]] && return
+
     while IFS=$'\t' read -r ltype ltext ldir lcid lago lmsgs; do
         case "$ltype" in
             H)
                 lines_text+=(""); lines_type+=("blank"); lines_dir+=(""); lines_cid+=(""); lines_selectable+=(0)
-                lines_text+=("$ltext"); lines_type+=("header"); lines_dir+=(""); lines_cid+=(""); lines_selectable+=(0)
-                ;;
+                lines_text+=("$ltext"); lines_type+=("header"); lines_dir+=(""); lines_cid+=(""); lines_selectable+=(0) ;;
             D)
-                lines_text+=("$ltext"); lines_type+=("dir"); lines_dir+=(""); lines_cid+=(""); lines_selectable+=(0)
-                ;;
+                lines_text+=("$ltext"); lines_type+=("dir"); lines_dir+=(""); lines_cid+=(""); lines_selectable+=(0) ;;
             S)
                 eval "local msg=$ltext dir=$ldir cid=$lcid"
                 local dot="○"
                 [[ -n "${running_dirs[$dir]}" ]] && dot="●"
                 lines_text+=("$dot $msg%%${lmsgs}m · $lago"); lines_type+=("session"); lines_dir+=("$dir"); lines_cid+=("$cid")
-                lines_selectable+=(1)
-                ;;
+                lines_selectable+=(1) ;;
         esac
-    done < "$parsed"
-    rm -rf "$tmpdir"
-
+    done < "$CACHE_FILE"
     total_lines=$#lines_text
+}
+
+fetch_and_build() {
+    if [[ -f "$CACHE_FILE" ]]; then
+        # Load from cache instantly
+        build_from_cache
+    else
+        # First run — no cache, must fetch
+        printf '  Loading sessions (first run)...\r'
+        refresh_cache
+        build_from_cache
+    fi
 }
 
 # --- Search & Nav ---
@@ -290,13 +281,13 @@ draw() {
     if [[ -n "$search" ]]; then
         printf '  %s🔍%s %s%s%s█  %sesc%s clear\r\n' "$Y" "$R" "$C" "$search" "$R" "$D" "$R"
     else
-        printf '  %s↑↓%s select  %s⏎%s resume  %s⌥n%s new  %s⌥d%s delete  %s⌥q%s quit  %stype%s search\r\n' \
-            "$D" "$R" "$D" "$R" "$D" "$R" "$D" "$R" "$D" "$R" "$D" "$R"
+        printf '  %s↑↓%s select  %s⏎%s resume  %s⌥n%s new  %s⌥d%s del  %s⌥r%s refresh  %s⌥q%s quit  %stype%s search\r\n' \
+            "$D" "$R" "$D" "$R" "$D" "$R" "$D" "$R" "$D" "$R" "$D" "$R" "$D" "$R"
     fi
 }
 
 # --- Actions ---
-cleanup() { printf '\e[?25h'; stty sane 2>/dev/null; }
+cleanup() { printf '\e[?25h'; stty sane 2>/dev/null; kill $REFRESH_PID 2>/dev/null; }
 trap cleanup EXIT INT TERM
 
 do_resume() {
@@ -326,12 +317,15 @@ do_delete() {
 # --- Main ---
 [[ ! -f "$DB" ]] && { echo "kiro-cli database not found"; exit 1; }
 
-printf '  Loading sessions...\r'
 fetch_and_build
 first_sel
 stty -echo raw
 printf '\e[?25l'
 draw
+
+# Refresh cache in background so next launch is fresh
+refresh_cache &
+REFRESH_PID=$!
 
 while true; do
     while read -rsk1 -t 0 _d 2>/dev/null; do :; done
@@ -353,6 +347,10 @@ while true; do
         $'\n'|$'\r') do_resume ;;
         opt-n) do_new ;;
         opt-d) do_delete ;;
+        opt-r)
+            stty sane; printf '\e[?25h\e[H\e[J  Refreshing...\r'
+            refresh_cache; build_from_cache; _prev_search="__init__"; first_sel; scroll=0
+            stty -echo raw; printf '\e[?25l' ;;
         opt-q|$'\x03') cleanup; exit 0 ;;
         $'\x7f'|$'\b')
             [[ -n "$search" ]] && { search="${search[1,-2]}"; _prev_search="__init__"; scroll=0; first_sel; } ;;

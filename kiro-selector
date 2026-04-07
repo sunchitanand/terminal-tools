@@ -76,15 +76,40 @@ for f in glob.glob('$tmpdir/*.raw'):
             sessions.append((proj(cur_dir), cur_dir, short(cur_dir), cur_cid, ago, title, msgs))
             count += 1
 from collections import OrderedDict
+import re as re2
+
+def ago_to_minutes(s):
+    """Convert '3 days ago', '2 hours ago', 'just now' etc to minutes for sorting."""
+    if s == 'just now': return 0
+    m = re2.match(r'(\d+)\s+(\w+)\s+ago', s)
+    if not m: return 999999
+    n, unit = int(m.group(1)), m.group(2)
+    if 'min' in unit: return n
+    if 'hour' in unit: return n * 60
+    if 'day' in unit: return n * 1440
+    if 'week' in unit: return n * 10080
+    if 'month' in unit: return n * 43200
+    return n * 525600
+
 groups = OrderedDict()
 for s in sessions:
     groups.setdefault(s[0], []).append(s)
-for p in sorted(groups.keys()):
+
+# Sort groups by most recent session (smallest ago value)
+sorted_groups = sorted(groups.items(), key=lambda kv: min(ago_to_minutes(s[4]) for s in kv[1]))
+
+for p, items in sorted_groups:
+    # Within each group, sort dirs by most recent session
+    dir_sessions = OrderedDict()
+    for s in items:
+        dir_sessions.setdefault(s[2], []).append(s)
+    sorted_dirs = sorted(dir_sessions.items(), key=lambda kv: min(ago_to_minutes(s[4]) for s in kv[1]))
+
     print(f"H\t{p}")
-    prev_dir = ''
-    for _, dir_path, short_path, cid, ago, title, msgs in groups[p]:
-        if short_path != prev_dir: print(f"D\t{short_path}"); prev_dir = short_path
-        print(f"S\t{shlex.quote(title)}\t{shlex.quote(dir_path)}\t{shlex.quote(cid)}\t{ago}\t{msgs}")
+    for short_path, dir_items in sorted_dirs:
+        print(f"D\t{short_path}")
+        for _, dir_path, _, cid, ago, title, msgs in dir_items:
+            print(f"S\t{shlex.quote(title)}\t{shlex.quote(dir_path)}\t{shlex.quote(cid)}\t{ago}\t{msgs}")
 PYEOF
     mv "${CACHE_FILE}.tmp" "$CACHE_FILE" 2>/dev/null
     rm -rf "$tmpdir"

@@ -1,0 +1,353 @@
+#!/usr/bin/env zsh
+# kiro-selector — TUI session manager for kiro-cli
+
+DB="$HOME/Library/Application Support/kiro-cli/data.sqlite3"
+HOME_DIR="$HOME"
+MAX_PER_DIR=5
+
+C=$'\e[36m' M=$'\e[35m' G=$'\e[32m' Y=$'\e[33m' D=$'\e[90m' R=$'\e[0m' B=$'\e[1m'
+SEL=$'\e[44;97m'
+
+# --- Data: flat list of display lines ---
+# Each line is either a header or a session. We store parallel arrays.
+typeset -a lines_text lines_type lines_dir lines_cid lines_selectable
+typeset -i total_lines=0 sel=0 scroll=0
+search="" search_mode=0
+
+fetch_and_build() {
+    lines_text=(); lines_type=(); lines_dir=(); lines_cid=(); lines_selectable=()
+    total_lines=0
+
+    # Get running dirs
+    typeset -A running_dirs
+    local pids=$(pgrep -f "kiro-cli/bun" 2>/dev/null | tr '\n' ',')
+    if [[ -n "$pids" ]]; then
+        pids="${pids%,}"
+        while IFS= read -r cwd; do
+            [[ -n "$cwd" ]] && running_dirs[$cwd]=1
+        done < <(lsof -p "$pids" -d cwd -Fn 2>/dev/null | grep '^n/' | cut -c2-)
+    fi
+
+    local tmpfile=$(mktemp /tmp/kiro-sel.XXXXXX)
+    python3 << PYEOF > "$tmpfile" 2>/dev/null
+import sqlite3, os, re, time, datetime, shlex
+db = os.path.expanduser('~/Library/Application Support/kiro-cli/data.sqlite3')
+conn = sqlite3.connect(db)
+rows = conn.execute("""
+    SELECT key, conversation_id, SUBSTR(value, 1, 1000), updated_at
+    FROM conversations_v2
+    WHERE conversation_id IN (
+        SELECT conversation_id FROM (
+            SELECT conversation_id, key,
+                   ROW_NUMBER() OVER (PARTITION BY key ORDER BY updated_at DESC) as rn
+            FROM conversations_v2
+        ) WHERE rn <= $MAX_PER_DIR
+    )
+    ORDER BY updated_at DESC
+""").fetchall()
+conn.close()
+
+prompt_re = re.compile(r'"prompt"\s*:\s*"((?:[^"\\\\]|\\\\.){1,120})')
+now = int(time.time())
+
+# Group by project
+def proj(p):
+    h = os.path.expanduser('~')
+    r = p[len(h)+1:] if p.startswith(h+'/') else p
+    for prefix, label in [('Documents/projects/', 'projects/'), ('Documents/code/', 'code/'), ('playground/', 'playground/'), ('doc-reviews', 'doc-reviews')]:
+        if r.startswith(prefix):
+            parts = r[len(prefix):].split('/', 1)
+            return label + (parts[0] if prefix != 'doc-reviews' else '')
+    if r.startswith('scratch'): return 'scratch'
+    return r.split('/')[0]
+
+def short(p):
+    h = os.path.expanduser('~')
+    return '~' + p[len(h):] if p.startswith(h) else p
+
+def ago_str(ts):
+    diff = now - ts
+    if diff < 60: return 'just now'
+    if diff < 3600: return f'{diff//60}m ago'
+    if diff < 86400: return f'{diff//3600}h ago'
+    if diff < 604800: return f'{diff//86400}d ago'
+    return datetime.datetime.fromtimestamp(ts).strftime('%b %d')
+
+# Build grouped structure
+from collections import OrderedDict
+groups = OrderedDict()
+for path, cid, snippet, updated_at in rows:
+    p = proj(path)
+    if p not in groups: groups[p] = []
+    m = prompt_re.search(snippet)
+    msg = m.group(1).replace('\\\\n', ' ').replace('\\\\"', '"')[:80] if m else '(no messages)'
+    msg = ' '.join(msg.split())
+    ts = (updated_at or 0) // 1000
+    ago = ago_str(ts)
+    sp = short(path)
+    groups[p].append((path, cid, sp, msg, ago))
+
+# Sort groups alphabetically
+for p in sorted(groups.keys()):
+    sessions = groups[p]
+    # Print header
+    print(f"H\t{p}\t\t")
+    prev_dir = ''
+    for path, cid, sp, msg, ago in sessions:
+        if sp != prev_dir:
+            print(f"D\t{sp}\t\t")
+            prev_dir = sp
+        print(f"S\t{shlex.quote(msg)}\t{shlex.quote(path)}\t{shlex.quote(cid)}\t{ago}")
+PYEOF
+    # Parse: type\ttext\tdir\tcid\tago
+    while IFS=$'\t' read -r ltype ltext ldir lcid lago; do
+        case "$ltype" in
+            H)
+                lines_text+=(""); lines_type+=("blank"); lines_dir+=(""); lines_cid+=(""); lines_selectable+=(0)
+                lines_text+=("$ltext"); lines_type+=("header"); lines_dir+=(""); lines_cid+=(""); lines_selectable+=(0)
+                ;;
+            D)
+                lines_text+=("$ltext"); lines_type+=("dir"); lines_dir+=(""); lines_cid+=(""); lines_selectable+=(0)
+                ;;
+            S)
+                # Unquote
+                eval "local msg=$ltext dir=$ldir cid=$lcid"
+                local dot="○"
+                [[ -n "${running_dirs[$dir]}" ]] && dot="●"
+                lines_text+=("$dot $msg"); lines_type+=("session"); lines_dir+=("$dir"); lines_cid+=("$cid")
+                lines_selectable+=(1)
+                # Store ago in a parallel way — append to text
+                lines_text[-1]="$dot $msg%%$lago"
+                ;;
+        esac
+    done < "$tmpfile"
+    rm -f "$tmpfile"
+
+    total_lines=$#lines_text
+}
+
+# --- Navigation ---
+line_matches() {
+    [[ -z "$search" ]] && return 0
+    [[ ${lines_selectable[$1]} -ne 1 ]] && return 1
+    local hay="${(L)lines_dir[$1]} ${(L)lines_text[$1]}"
+    local needle="${(L)search}"
+    local hi=1 ni=1
+    while [[ $ni -le $#needle ]]; do
+        [[ $hi -gt $#hay ]] && return 1
+        [[ "${hay[$hi]}" == "${needle[$ni]}" ]] && ((ni++))
+        ((hi++))
+    done
+    return 0
+}
+
+next_sel() {
+    local i=$((sel + 1)) start=$sel
+    while (( i != start )); do
+        (( i > total_lines )) && i=1
+        [[ ${lines_selectable[i]} -eq 1 ]] && line_matches $i && { sel=$i; return; }
+        ((i++))
+        (( i > total_lines )) && i=1
+    done
+}
+
+prev_sel() {
+    local i=$((sel - 1)) start=$sel
+    while (( i != start )); do
+        (( i < 1 )) && i=$total_lines
+        [[ ${lines_selectable[i]} -eq 1 ]] && line_matches $i && { sel=$i; return; }
+        ((i--))
+        (( i < 1 )) && i=$total_lines
+    done
+}
+
+first_sel() {
+    sel=1
+    while (( sel <= total_lines )); do
+        [[ ${lines_selectable[sel]} -eq 1 ]] && line_matches $sel && return
+        ((sel++))
+    done
+    sel=1
+}
+
+# --- Draw ---
+draw() {
+    local vis=$(( LINES - 5 ))
+    [[ -n "$search" ]] && vis=$(( LINES - 6 ))
+
+    # Build filtered line indices
+    typeset -a filt
+    if [[ -z "$search" ]]; then
+        for i in {1..$total_lines}; do filt+=($i); done
+    else
+        # Show lines that are sessions matching search, plus their parent dir/header
+        typeset -A show_lines
+        for i in {1..$total_lines}; do
+            [[ ${lines_selectable[i]} -eq 1 ]] && line_matches $i && show_lines[$i]=1
+        done
+        # For each matching session, include preceding dir and header
+        for i in ${(k)show_lines}; do
+            local j=$((i-1))
+            while (( j >= 1 )); do
+                [[ "${lines_type[j]}" == "dir" ]] && { show_lines[$j]=1; break; }
+                ((j--))
+            done
+            while (( j >= 1 )); do
+                [[ "${lines_type[j]}" == "header" ]] && { show_lines[$j]=1; break; }
+                ((j--))
+            done
+        done
+        for i in {1..$total_lines}; do
+            [[ -n "${show_lines[$i]}" ]] && filt+=($i)
+        done
+    fi
+
+    # Find sel's position in filtered list
+    local sel_pos=0
+    for fi in {1..$#filt}; do
+        [[ ${filt[fi]} -eq $sel ]] && { sel_pos=$fi; break; }
+    done
+
+    # Scroll based on filtered position
+    (( sel_pos > 0 && sel_pos <= scroll )) && scroll=$(( sel_pos - 1 ))
+    (( sel_pos > scroll + vis )) && scroll=$(( sel_pos - vis ))
+    (( scroll < 0 )) && scroll=0
+
+    printf '\e[H\e[J'
+    printf '  %s⚡ kiro-cli sessions%s\r\n\r\n' "$M" "$R"
+
+    local drawn=0
+    for fi in {$((scroll+1))..$((scroll+vis))}; do
+        (( fi > $#filt )) && { printf '\r\n'; ((drawn++)); continue; }
+        local i=${filt[fi]}
+        local t="${lines_type[i]}"
+        local txt="${lines_text[i]}"
+
+        case "$t" in
+            blank)
+                printf '\r\n'
+                ;;
+            header)
+                printf '  %s%s%s\r\n' "$B$M" "$txt" "$R"
+                ;;
+            dir)
+                printf '    %s%s%s\r\n' "$C" "$txt" "$R"
+                ;;
+            session)
+                local msg="${txt%%\%\%*}"
+                local ago="${txt#*\%\%}"
+                local W=$(( COLUMNS - 10 ))
+                (( W > 100 )) && W=100
+                local ago_len=$(( ${#ago} + 2 ))
+                local msg_w=$(( W - ago_len ))
+                [[ ${#msg} -gt $msg_w ]] && msg="${msg[1,$((msg_w-2))]}.."
+
+                if [[ $i -eq $sel ]]; then
+                    printf '  %s  %-*s %s%s\r\n' "$SEL" $((W - ago_len)) "$msg" "$ago" "$R"
+                else
+                    local dot="${msg[1]}"
+                    local rest="${msg[3,-1]}"
+                    local dc="$D"
+                    [[ "$dot" == "●" ]] && dc="$G"
+                    printf '   %s%s%s %s%-*s%s %s%s%s\r\n' \
+                        "$dc" "$dot" "$R" "" $((W - ago_len - 2)) "$rest" "" "$D" "$ago" "$R"
+                fi
+                ;;
+        esac
+        ((drawn++))
+    done
+
+    printf '\r\n'
+    if [[ -n "$search" ]]; then
+        printf '  %s🔍%s %s%s%s█  %sesc%s clear\r\n' "$Y" "$R" "$C" "$search" "$R" "$D" "$R"
+    else
+        printf '  %s↑↓%s select  %s⏎%s resume  %s⌥n%s new  %s⌥d%s delete  %s⌥q%s quit  %stype%s to search\r\n' \
+            "$D" "$R" "$D" "$R" "$D" "$R" "$D" "$R" "$D" "$R" "$D" "$R"
+    fi
+}
+
+# --- Actions ---
+cleanup() { printf '\e[?25h'; stty sane 2>/dev/null; }
+trap cleanup EXIT INT TERM
+
+do_resume() {
+    [[ ${lines_selectable[sel]} -ne 1 ]] && return
+    local dir="${lines_dir[sel]}"
+    [[ -z "$dir" ]] && return
+    cleanup; cd "$dir" && exec kiro-cli chat --resume
+}
+
+do_new() {
+    [[ ${lines_selectable[sel]} -ne 1 ]] && return
+    local dir="${lines_dir[sel]}"
+    [[ -z "$dir" ]] && return
+    cleanup; cd "$dir" && exec kiro-cli chat
+}
+
+do_delete() {
+    [[ ${lines_selectable[sel]} -ne 1 ]] && return
+    local dir="${lines_dir[sel]}" cid="${lines_cid[sel]}"
+    local msg="${lines_text[sel]%%\%\%*}"
+    msg="${msg[3,42]}"
+    stty sane; printf '\e[?25h'
+    printf '\n  %sDelete "%s%s%s"? (y/n):%s ' "$C" "$M" "$msg" "$C" "$R"
+    read -rsk1 confirm
+    if [[ "$confirm" == "y" ]]; then
+        python3 -c "
+import sqlite3, os
+db = os.path.expanduser('~/Library/Application Support/kiro-cli/data.sqlite3')
+conn = sqlite3.connect(db)
+conn.execute('DELETE FROM conversations_v2 WHERE key = ? AND conversation_id = ?', ('''$dir''', '''$cid'''))
+conn.commit(); conn.close()
+" 2>/dev/null
+        fetch_and_build; first_sel
+    fi
+    stty -echo raw; printf '\e[?25l'
+}
+
+# --- Main ---
+[[ ! -f "$DB" ]] && { echo "kiro-cli database not found at $DB"; exit 1; }
+
+fetch_and_build
+first_sel
+stty -echo raw
+printf '\e[?25l'
+draw
+
+while true; do
+    while read -rsk1 -t 0 _d 2>/dev/null; do :; done
+    read -rsk1 key
+    if [[ "$key" == $'\e' ]]; then
+        read -rsk1 -t 0.05 k2
+        if [[ -z "$k2" ]]; then
+            # Bare escape — clear search
+            [[ -n "$search" ]] && { search=""; search_mode=0; first_sel; scroll=0; }
+        elif [[ "$k2" == '[' || "$k2" == 'O' ]]; then
+            # Arrow keys
+            read -rsk1 -t 0.05 k3; key="${key}${k2}${k3}"
+        else
+            # Option+key: \e followed by a letter
+            key="opt-${k2}"
+        fi
+    fi
+
+    case "$key" in
+        $'\e[A'|$'\eOA') prev_sel ;;
+        $'\e[B'|$'\eOB') next_sel ;;
+        $'\n'|$'\r') do_resume ;;
+        opt-n) do_new ;;
+        opt-d) do_delete ;;
+        opt-q|$'\x03') cleanup; exit 0 ;;  # opt-q or ctrl-c
+        $'\x7f'|$'\b')
+            if [[ -n "$search" ]]; then
+                search="${search[1,-2]}"
+                first_sel; scroll=0
+            fi ;;
+        [[:print:]])
+            # Any printable char — search
+            search+="$key"
+            search_mode=1
+            first_sel ;;
+    esac
+    draw
+done

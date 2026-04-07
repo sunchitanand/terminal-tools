@@ -1,0 +1,543 @@
+#!/usr/bin/env zsh
+HOST="${1:-sunchit-cd2.aka.corp.amazon.com}"
+SSH_OPTS=(-o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o LogLevel=ERROR)
+RTMUX='PATH=/apollo/env/envImprovement/bin:$PATH tmux -u'
+CONFIG="$HOME/.tmux-projects.json"
+
+C=$'\e[36m' M=$'\e[35m' G=$'\e[32m' Y=$'\e[33m' D=$'\e[90m' R=$'\e[0m' B=$'\e[1m'
+SEL=$'\e[44;97m' ON=$'\e[32m●\e[0m' OFF=$'\e[90m○\e[0m' HI=$'\e[43;30m'
+
+# --- Config helpers (JSON via python3, stored locally) ---
+
+read_config() {
+    [[ -f "$CONFIG" ]] || return
+    python3 -c "
+import json,sys
+d=json.load(open('$CONFIG'))
+for name,dir in d.get('$HOST',{}).items():
+    print(f'{name}\t{dir}')
+" 2>/dev/null
+}
+
+write_config() {
+    python3 -c "
+import json,os,sys
+f='$CONFIG'
+d=json.load(open(f)) if os.path.exists(f) else {}
+h=d.setdefault('$(printf '%s' "$HOST")',{})
+for line in sys.stdin:
+    line=line.strip()
+    if not line: continue
+    parts=line.split('\t',1)
+    name=parts[0]
+    dir=parts[1] if len(parts)>1 else ''
+    if dir: h[name]=dir
+    elif name not in h: h[name]=''
+d['$(printf '%s' "$HOST")']=h
+json.dump(d,open(f,'w'),indent=2)
+" 2>/dev/null
+}
+
+remove_from_config() {
+    local session_name="$1"
+    python3 -c "
+import json,os
+f='$CONFIG'
+if not os.path.exists(f): exit()
+d=json.load(open(f))
+h=d.get('$(printf '%s' "$HOST")',{})
+h.pop('$session_name',None)
+d['$(printf '%s' "$HOST")']=h
+json.dump(d,open(f,'w'),indent=2)
+" 2>/dev/null
+}
+
+# --- Data arrays (zsh 1-indexed) ---
+typeset -a sess_names sess_running sess_created sess_activity sess_dirs
+
+fetch_sessions() {
+    sess_names=(); sess_running=(); sess_created=(); sess_activity=(); sess_dirs=()
+
+    local raw
+    raw=$(ssh $SSH_OPTS $HOST "
+        $RTMUX ls -F '#{session_name}|#{session_created}|#{session_activity}' 2>/dev/null
+        echo '==='
+        $RTMUX ls -F '#{session_name}|#{pane_current_path}' 2>/dev/null
+    " 2>/dev/null)
+
+    typeset -A run_created run_activity run_dirs
+    local section=sessions
+    while IFS= read -r line; do
+        [[ "$line" == "===" ]] && section=dirs && continue
+        [[ -z "$line" ]] && continue
+        if [[ "$section" == "sessions" ]]; then
+            local name="${line%%|*}"; local rest="${line#*|}"
+            local ts_created="${rest%%|*}"; local ts_activity="${rest#*|}"
+            run_created[$name]="$(date -r "$ts_created" '+%b %d %H:%M' 2>/dev/null)"
+            run_activity[$name]="$(date -r "$ts_activity" '+%b %d %H:%M' 2>/dev/null)"
+        else
+            local name="${line%%|*}"; local dir="${line#*|}"
+            run_dirs[$name]="$dir"
+        fi
+    done <<< "$raw"
+
+    typeset -A cfg_dirs
+    typeset -a cfg_order
+    while IFS=$'\t' read -r name dir; do
+        [[ -z "$name" ]] && continue
+        cfg_dirs[$name]="$dir"
+        cfg_order+=("$name")
+    done < <(read_config)
+
+    typeset -A seen
+    for name in $cfg_order; do
+        seen[$name]=1
+        sess_names+=("$name")
+        if [[ -n "${run_created[$name]}" ]]; then
+            sess_running+=(1)
+            sess_created+=("${run_created[$name]}")
+            sess_activity+=("${run_activity[$name]}")
+            sess_dirs+=("${run_dirs[$name]}")
+        else
+            sess_running+=(0)
+            sess_created+=("")
+            sess_activity+=("")
+            sess_dirs+=("${cfg_dirs[$name]}")
+        fi
+    done
+    for name in ${(ko)run_created}; do
+        [[ -n "${seen[$name]}" ]] && continue
+        sess_names+=("$name")
+        sess_running+=(1)
+        sess_created+=("${run_created[$name]}")
+        sess_activity+=("${run_activity[$name]}")
+        sess_dirs+=("${run_dirs[$name]}")
+    done
+
+    {
+        for i in {1..$#sess_names}; do
+            if [[ ${sess_running[i]} -eq 1 && -n "${sess_dirs[i]}" ]]; then
+                printf '%s\t%s\n' "${sess_names[i]}" "${sess_dirs[i]}"
+            elif [[ -n "${cfg_dirs[${sess_names[i]}]}" ]]; then
+                printf '%s\t%s\n' "${sess_names[i]}" "${cfg_dirs[${sess_names[i]}]}"
+            else
+                printf '%s\t\n' "${sess_names[i]}"
+            fi
+        done
+    } | write_config
+}
+
+# --- Display building ---
+typeset -a dsp_text dsp_type dsp_idx
+typeset -a selectable
+search=""
+search_mode=0
+viewport_top=1
+
+build_display() {
+    dsp_text=(); dsp_type=(); dsp_idx=(); selectable=()
+
+    dsp_text+=("+ New session"); dsp_type+=("new"); dsp_idx+=(0)
+    selectable+=(1)
+
+    typeset -A proj_members
+    typeset -a proj_order
+    for i in {1..$#sess_names}; do
+        local name="${sess_names[i]}"
+        local proj
+        if [[ "$name" == */* ]]; then proj="${name%%/*}"; else proj="other"; fi
+        if [[ -z "${proj_members[$proj]}" ]]; then
+            proj_members[$proj]="$i"
+            proj_order+=("$proj")
+        else
+            proj_members[$proj]="${proj_members[$proj]} $i"
+        fi
+    done
+
+    # sort projects alphabetically, keep "other" last
+    typeset -a ordered
+    for p in ${(o)proj_order}; do [[ "$p" != "other" ]] && ordered+=("$p"); done
+    [[ -n "${proj_members[other]}" ]] && ordered+=("other")
+
+    for proj in $ordered; do
+        dsp_text+=("$proj"); dsp_type+=("header"); dsp_idx+=(0)
+        # sort sessions within project by activity time descending (latest first)
+        typeset -a proj_idxs
+        proj_idxs=(${(s: :)proj_members[$proj]})
+        proj_idxs=($(for i in $proj_idxs; do
+            echo "${sess_activity[i]:-0000 Jan 01 00:00} $i"
+        done | sort -r | awk '{print $NF}'))
+        for i in $proj_idxs; do
+            local name="${sess_names[i]}"
+            local short="${name#*/}"
+            [[ "$name" != */* ]] && short="$name"
+            dsp_text+=("$short"); dsp_type+=("session"); dsp_idx+=($i)
+            selectable+=($#dsp_text)
+        done
+    done
+}
+
+# --- Search helpers ---
+
+fuzzy_match() {
+    local haystack="${(L)1}" needle="${(L)2}"
+    local hi=1 ni=1
+    while [[ $ni -le $#needle ]]; do
+        [[ $hi -gt $#haystack ]] && return 1
+        if [[ "${haystack[$hi]}" == "${needle[$ni]}" ]]; then ((ni++)); fi
+        ((hi++))
+    done
+    return 0
+}
+
+is_match() {
+    local sel_idx=$1
+    [[ -z "$search" ]] && return 0
+    local di=${selectable[sel_idx]}
+    [[ "${dsp_type[di]}" == "new" ]] && return 1
+    local si=${dsp_idx[di]}
+    fuzzy_match "${sess_names[si]}" "$search"
+}
+
+nav_up() {
+    local start=$sel
+    while true; do
+        if [[ $sel -gt 1 ]]; then ((sel--)); else sel=$#selectable; fi
+        [[ $sel -eq $start ]] && break
+        if [[ -z "$search" ]] || is_match $sel; then break; fi
+    done
+    if [[ $sel -gt $start ]]; then
+        # wrapped to bottom — find viewport_top that fills screen with sel at bottom
+        local max_line=$(( LINES - 3 ))
+        local try=$sel
+        while [[ $try -gt 1 ]]; do
+            local vp_dsp=${selectable[$try]}
+            local lines_used=4 in_vp=0
+            for i in {1..$#dsp_text}; do
+                [[ $lines_used -ge $max_line ]] && break
+                [[ $i -eq $vp_dsp ]] && in_vp=1
+                [[ $in_vp -eq 0 ]] && continue
+                case "${dsp_type[i]}" in
+                    new) ((lines_used++)) ;;
+                    header) ((lines_used+=3)) ;;
+                    session)
+                        local si=${dsp_idx[i]}
+                        [[ -n "$search" ]] && ! fuzzy_match "${sess_names[si]}" "$search" && continue
+                        ((lines_used++)) ;;
+                esac
+            done
+            [[ $lines_used -ge $max_line ]] && break
+            ((try--))
+        done
+        viewport_top=$try
+    elif [[ $sel -lt $viewport_top ]]; then
+        viewport_top=$sel
+    fi
+}
+
+nav_down() {
+    local start=$sel
+    while true; do
+        if [[ $sel -lt $#selectable ]]; then ((sel++)); else sel=1; fi
+        [[ $sel -eq $start ]] && break
+        if [[ -z "$search" ]] || is_match $sel; then break; fi
+    done
+    [[ $sel -lt $start ]] && viewport_top=1
+}
+
+jump_to_first_match() {
+    for i in {1..$#selectable}; do
+        if is_match $i; then sel=$i; return; fi
+    done
+}
+
+# --- Drawing ---
+
+draw() {
+    local max_line=$(( LINES - 3 ))
+    local sel_dsp=${selectable[$sel]}
+
+    # ensure viewport_top shows sel
+    local vp_dsp=${selectable[$viewport_top]}
+    local lines_used=6 found_sel=0 in_vp=0
+    for i in {1..$#dsp_text}; do
+        [[ $lines_used -ge $max_line ]] && break
+        [[ $i -eq $vp_dsp ]] && in_vp=1
+        [[ $in_vp -eq 0 ]] && continue
+        case "${dsp_type[i]}" in
+            new) ((lines_used++)) ;;
+            header)
+                if [[ -n "$search" ]]; then
+                    local hm=0
+                    for j in {$((i+1))..$#dsp_text}; do
+                        [[ "${dsp_type[j]}" == "header" ]] && break
+                        [[ "${dsp_type[j]}" == "session" ]] && fuzzy_match "${sess_names[${dsp_idx[j]}]}" "$search" && hm=1 && break
+                    done
+                    [[ $hm -eq 0 ]] && continue
+                fi
+                ((lines_used+=3)) ;;
+            session)
+                local si=${dsp_idx[i]}
+                [[ -n "$search" ]] && ! fuzzy_match "${sess_names[si]}" "$search" && continue
+                [[ $i -eq $sel_dsp ]] && found_sel=1
+                ((lines_used++)) ;;
+        esac
+    done
+    if [[ $found_sel -eq 0 && $sel -gt $viewport_top && $viewport_top -lt $#selectable ]]; then
+        ((viewport_top++))
+        vp_dsp=${selectable[$viewport_top]}
+    fi
+
+    printf '\e[H\e[J\r\n'
+    printf '  %s⚡ tmux :: %s%s%s\r\n' "$M" "$C" "${HOST%%.*}" "$R"
+
+    local line=3
+    local in_viewport=0
+    vp_dsp=${selectable[$viewport_top]}
+
+    # top border
+    printf '  %s┌─%-2s─┬─%-28s─┬─%-12s─┬─%-12s─┐%s\r\n' \
+        "$D" "──" "────────────────────────────" "────────────" "────────────" "$R"
+    ((line++))
+    # header row
+    printf '  %s│ %-2s │ %-28s │ %-12s │ %-12s │%s\r\n' \
+        "$D" "  " "SESSION" "STARTED" "ACTIVE" "$R"
+    ((line++))
+
+    local prev_proj=""
+    local first_section=1
+
+    for i in {1..$#dsp_text}; do
+        [[ $line -ge $max_line ]] && break
+        [[ $i -eq $vp_dsp ]] && in_viewport=1
+        [[ $in_viewport -eq 0 ]] && continue
+        case "${dsp_type[i]}" in
+            new)
+                if [[ -z "$search" ]]; then
+                    printf '  %s├─%-2s─┼─%-28s─┼─%-12s─┼─%-12s─┤%s\r\n' \
+                        "$D" "──" "────────────────────────────" "────────────" "────────────" "$R"
+                    ((line++))
+                    [[ $line -ge $max_line ]] && break
+                    if [[ $i -eq $sel_dsp ]]; then
+                        printf '  %s│%s %-2s %s│%s %-28s %s│%s %-12s %s│%s %-12s %s│%s\r\n' \
+                            "$D" "$SEL" "  " "$D" "$SEL" "+ New session" "$D" "$SEL" "" "$D" "$SEL" "" "$D" "$R"
+                    else
+                        printf '  %s│%s %-2s %s│ %s%-28s%s │ %-12s │ %-12s │%s\r\n' \
+                            "$D" "$R" "  " "$D" "$G" "+ New session" "$R" "" "" "$R"
+                    fi
+                    ((line++))
+                fi
+                ;;
+            header)
+                if [[ -n "$search" ]]; then
+                    local has_match=0
+                    for j in {$((i+1))..$#dsp_text}; do
+                        [[ "${dsp_type[j]}" == "header" ]] && break
+                        [[ "${dsp_type[j]}" == "session" ]] && fuzzy_match "${sess_names[${dsp_idx[j]}]}" "$search" && has_match=1 && break
+                    done
+                    [[ $has_match -eq 0 ]] && continue
+                fi
+                printf '  %s├─%-2s─┼─%-28s─┼─%-12s─┼─%-12s─┤%s\r\n' \
+                    "$D" "──" "────────────────────────────" "────────────" "────────────" "$R"
+                ((line++))
+                [[ $line -ge $max_line ]] && break
+                printf '  %s│%s %-2s %s│ %s%-28s%s │ %-12s │ %-12s %s│%s\r\n' \
+                    "$D" "$R" "  " "$D" "$B$M" "${dsp_text[i]}" "$R" "" "" "$D" "$R"
+                ((line++))
+                ;;
+            session)
+                local si=${dsp_idx[i]}
+                [[ -n "$search" ]] && ! fuzzy_match "${sess_names[si]}" "$search" && continue
+                local dot="○"
+                [[ ${sess_running[si]} -eq 1 ]] && dot="●"
+                local dc="$D" nc="$D"
+                [[ ${sess_running[si]} -eq 1 ]] && dc="$G" nc="$C"
+                local created="${sess_created[si]}" activity="${sess_activity[si]}"
+                if [[ $i -eq $sel_dsp ]]; then
+                    printf '  %s│%s %s %s%s│%s %-28s %s│%s %-12s %s│%s %-12s %s│%s\r\n' \
+                        "$D" "$SEL" "$dot" "$D" "$SEL" "$SEL" "${dsp_text[i]}" \
+                        "$D$SEL" "$SEL" "$created" \
+                        "$D$SEL" "$SEL" "$activity" "$D" "$R"
+                else
+                    printf '  %s│ %s%s%s │ %s%-28s%s │ %s%-12s%s │ %s%-12s%s %s│%s\r\n' \
+                        "$D" "$dc" "$dot" "$R" \
+                        "$nc" "${dsp_text[i]}" "$R" \
+                        "$Y" "$created" "$R" \
+                        "$Y" "$activity" "$R" "$D" "$R"
+                fi
+                ((line++))
+                ;;
+        esac
+    done
+
+    # bottom border
+    printf '  %s└─%-2s─┴─%-28s─┴─%-12s─┴─%-12s─┘%s\r\n' \
+        "$D" "──" "────────────────────────────" "────────────" "────────────" "$R"
+    ((line++))
+
+    printf '\r\n'
+    if [[ $search_mode -eq 1 ]]; then
+        printf '  %s🔍%s %s%s%s█  %sesc%s clear\r\n' "$Y" "$R" "$C" "$search" "$R" "$D" "$R"
+    else
+        local keys='%s↑↓%s select  %s⏎%s attach  %s␣%s rename  %sd%s delete  %sq%s quit\r\n'
+        printf "  $keys" "$D" "$R" "$D" "$R" "$D" "$R" "$D" "$R" "$D" "$R"
+    fi
+}
+
+# --- Helpers ---
+
+current_session_name() {
+    local si=${dsp_idx[${selectable[sel]}]}
+    [[ $si -gt 0 ]] && echo "${sess_names[si]}"
+}
+
+current_session_dir() {
+    local si=${dsp_idx[${selectable[sel]}]}
+    [[ $si -gt 0 ]] && echo "${sess_dirs[si]}"
+}
+
+is_current_running() {
+    local si=${dsp_idx[${selectable[sel]}]}
+    [[ $si -gt 0 && ${sess_running[si]} -eq 1 ]]
+}
+
+is_on_new() {
+    [[ "${dsp_type[${selectable[sel]}]}" == "new" ]]
+}
+
+cleanup() { printf '\e[?25h'; stty sane 2>/dev/null; }
+trap cleanup EXIT INT TERM
+
+# --- Main ---
+
+fetch_sessions
+build_display
+sel=1
+stty -echo raw
+printf '\e[?25l\e[H\e[J'
+draw
+
+while true; do
+    while read -rsk1 -t 0 _d 2>/dev/null; do :; done
+    read -rsk1 key
+    if [[ "$key" == $'\e' ]]; then
+        read -rsk1 -t 0.05 k2
+        if [[ -z "$k2" ]]; then
+            if [[ $search_mode -eq 1 ]]; then
+                search=""; search_mode=0; sel=1; viewport_top=1
+                draw; continue
+            fi
+        else
+            read -rsk1 -t 0.05 k3; key="${key}${k2}${k3}"
+        fi
+    fi
+
+    if [[ $search_mode -eq 1 ]]; then
+        case "$key" in
+            $'\e[A'|$'\eOA') nav_up ;;
+            $'\e[B'|$'\eOB') nav_down ;;
+            $'\n'|$'\r'|'')
+                search_mode=0
+                if is_on_new; then
+                    stty sane; printf '\e[?25h'
+                    printf '\n  %sSession name (project/name):%s ' "$C" "$R"
+                    read -r new_name
+                    if [[ -n "$new_name" ]]; then
+                        cleanup; exec ssh $SSH_OPTS -t $HOST "$RTMUX new -s \"$new_name\""
+                    fi
+                    stty -echo raw; printf '\e[?25l'
+                elif is_current_running; then
+                    cleanup; exec ssh $SSH_OPTS -t $HOST "$RTMUX attach -t \"$(current_session_name)\""
+                else
+                    local dir="$(current_session_dir)"
+                    local name="$(current_session_name)"
+                    local cd_cmd=""
+                    [[ -n "$dir" ]] && cd_cmd="cd $dir &&"
+                    cleanup; exec ssh $SSH_OPTS -t $HOST "$RTMUX new -s \"$name\" '$cd_cmd exec \$SHELL'"
+                fi ;;
+            $'\x7f'|$'\b')
+                if [[ -n "$search" ]]; then
+                    search="${search[1,-2]}"
+                    if [[ -n "$search" ]]; then jump_to_first_match; else search_mode=0; sel=1; fi
+                    viewport_top=1
+                else
+                    search_mode=0; sel=1; viewport_top=1
+                fi ;;
+            [[:print:]])
+                search+="$key"
+                jump_to_first_match ;;
+        esac
+    else
+        case "$key" in
+            $'\e[A'|$'\eOA') nav_up ;;
+            $'\e[B'|$'\eOB') nav_down ;;
+            $'\n'|$'\r'|'')
+                if is_on_new; then
+                    stty sane; printf '\e[?25h'
+                    printf '\n  %sSession name (project/name):%s ' "$C" "$R"
+                    read -r new_name
+                    if [[ -n "$new_name" ]]; then
+                        cleanup; exec ssh $SSH_OPTS -t $HOST "$RTMUX new -s \"$new_name\""
+                    fi
+                    stty -echo raw; printf '\e[?25l'
+                elif is_current_running; then
+                    cleanup; exec ssh $SSH_OPTS -t $HOST "$RTMUX attach -t \"$(current_session_name)\""
+                else
+                    local dir="$(current_session_dir)"
+                    local name="$(current_session_name)"
+                    local cd_cmd=""
+                    [[ -n "$dir" ]] && cd_cmd="cd $dir &&"
+                    cleanup; exec ssh $SSH_OPTS -t $HOST "$RTMUX new -s \"$name\" '$cd_cmd exec \$SHELL'"
+                fi ;;
+            ' ')
+                if ! is_on_new; then
+                    local old_name="$(current_session_name)"
+                    stty sane; printf '\e[?25h'
+                    printf '\n  %sNew name for %s%s%s:%s ' "$C" "$M" "$old_name" "$C" "$R"
+                    read -r new_name
+                    if [[ -n "$new_name" ]]; then
+                        local old_dir="$(current_session_dir)"
+                        if is_current_running; then
+                            ssh $SSH_OPTS $HOST "$RTMUX rename-session -t \"$old_name\" \"$new_name\"" 2>/dev/null
+                        fi
+                        remove_from_config "$old_name"
+                        printf '%s\t%s\n' "$new_name" "$old_dir" | write_config
+                        fetch_sessions; build_display
+                        search=""; sel=1; viewport_top=1
+                    fi
+                    stty -echo raw; printf '\e[?25l'
+                fi ;;
+            'd')
+                if ! is_on_new; then
+                    local name="$(current_session_name)"
+                    stty sane; printf '\e[?25h'
+                    printf '\n  %sDelete %s%s%s? (y/n):%s ' "$C" "$M" "$name" "$C" "$R"
+                    read -rsk1 confirm
+                    if [[ "$confirm" == "y" ]]; then
+                        if is_current_running; then
+                            ssh $SSH_OPTS $HOST "$RTMUX kill-session -t \"$name\"" 2>/dev/null
+                        fi
+                        remove_from_config "$name"
+                        fetch_sessions; build_display
+                        search=""
+                        [[ $sel -gt $#selectable ]] && sel=$#selectable
+                        [[ $sel -lt 1 ]] && sel=1
+                    fi
+                    stty -echo raw; printf '\e[?25l'
+                fi ;;
+            '/')
+                search_mode=1; search="" ;;
+            'q')
+                if [[ -n "$search" ]]; then
+                    search=""; search_mode=0; sel=1; viewport_top=1
+                else
+                    cleanup; exit 0
+                fi ;;
+            [[:print:]])
+                search_mode=1; search="$key"
+                jump_to_first_match ;;
+            *) ;;
+        esac
+    fi
+    draw
+done

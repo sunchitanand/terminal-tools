@@ -291,21 +291,19 @@ draw() {
     printf '\e[H\e[J\r\n'
     printf '  %s⚡ tmux :: %s%s%s\r\n' "$M" "$C" "${HOST%%.*}" "$R"
 
+    # Column positions (absolute terminal columns)
+    local C2=9 C3=40 C4=55 C5=70
+    local hr="  ${D}┌─────┬──────────────────────────────┬──────────────┬──────────────┐${R}"
+    local sep="  ${D}├─────┼──────────────────────────────┼──────────────┼──────────────┤${R}"
+    local bot="  ${D}└─────┴──────────────────────────────┴──────────────┴──────────────┘${R}"
+
     local line=3
     local in_viewport=0
     vp_dsp=${selectable[$viewport_top]}
 
-    # top border
-    printf '  %s┌─%-2s─┬─%-28s─┬─%-12s─┬─%-12s─┐%s\r\n' \
-        "$D" "──" "────────────────────────────" "────────────" "────────────" "$R"
+    printf '%s\r\n' "$hr"; ((line++))
+    printf "  %s│    \e[${C2}G│ SESSION\e[${C3}G│ STARTED\e[${C4}G│ ACTIVE\e[${C5}G│%s\r\n" "$D" "$R"
     ((line++))
-    # header row
-    printf '  %s│ %-2s │ %-28s │ %-12s │ %-12s │%s\r\n' \
-        "$D" "  " "SESSION" "STARTED" "ACTIVE" "$R"
-    ((line++))
-
-    local prev_proj=""
-    local first_section=1
 
     for i in {1..$#dsp_text}; do
         [[ $line -ge $max_line ]] && break
@@ -314,16 +312,14 @@ draw() {
         case "${dsp_type[i]}" in
             new)
                 if [[ -z "$search" ]]; then
-                    printf '  %s├─%-2s─┼─%-28s─┼─%-12s─┼─%-12s─┤%s\r\n' \
-                        "$D" "──" "────────────────────────────" "────────────" "────────────" "$R"
-                    ((line++))
+                    printf '%s\r\n' "$sep"; ((line++))
                     [[ $line -ge $max_line ]] && break
                     if [[ $i -eq $sel_dsp ]]; then
-                        printf '  %s│%s %-2s %s│%s %-28s %s│%s %-12s %s│%s %-12s %s│%s\r\n' \
-                            "$D" "$SEL" "  " "$D" "$SEL" "+ New session" "$D" "$SEL" "" "$D" "$SEL" "" "$D" "$R"
+                        printf "  %s│%s    \e[${C2}G%s│%s + New session\e[${C3}G%s│\e[${C4}G│\e[${C5}G│%s\r\n" \
+                            "$D" "$SEL" "$D" "$SEL" "$D" "$R"
                     else
-                        printf '  %s│%s %-2s %s│ %s%-28s%s │ %-12s │ %-12s │%s\r\n' \
-                            "$D" "$R" "  " "$D" "$G" "+ New session" "$R" "" "" "$R"
+                        printf "  %s│    \e[${C2}G│ %s+ New session%s\e[${C3}G%s│\e[${C4}G│\e[${C5}G│%s\r\n" \
+                            "$D" "$G" "$R" "$D" "$R"
                     fi
                     ((line++))
                 fi
@@ -337,12 +333,11 @@ draw() {
                     done
                     [[ $has_match -eq 0 ]] && continue
                 fi
-                printf '  %s├─%-2s─┼─%-28s─┼─%-12s─┼─%-12s─┤%s\r\n' \
-                    "$D" "──" "────────────────────────────" "────────────" "────────────" "$R"
+                printf '%s\r\n' "$sep"
                 ((line++))
                 [[ $line -ge $max_line ]] && break
-                printf '  %s│%s %-2s %s│ %s%-28s%s │ %-12s │ %-12s %s│%s\r\n' \
-                    "$D" "$R" "  " "$D" "$B$M" "${dsp_text[i]}" "$R" "" "" "$D" "$R"
+                printf "  %s│    \e[${C2}G│ %s%s%s\e[${C3}G%s│\e[${C4}G│\e[${C5}G│%s\r\n" \
+                    "$D" "$B$M" "${dsp_text[i]}" "$R" "$D" "$R"
                 ((line++))
                 ;;
             session)
@@ -351,28 +346,29 @@ draw() {
                 local dot="○"
                 [[ ${sess_running[si]} -eq 1 ]] && dot="●"
                 local dc="$D" nc="$D"
-                [[ ${sess_running[si]} -eq 1 ]] && dc="$G" nc="$C"
+                [[ ${sess_running[si]} -eq 1 ]] && dc="$G" && nc="$C"
                 local created="${sess_created[si]}" activity="${sess_activity[si]}"
                 if [[ $i -eq $sel_dsp ]]; then
-                    printf '  %s│%s %s %s%s│%s %-28s %s│%s %-12s %s│%s %-12s %s│%s\r\n' \
-                        "$D" "$SEL" "$dot" "$D" "$SEL" "$SEL" "${dsp_text[i]}" \
-                        "$D$SEL" "$SEL" "$created" \
-                        "$D$SEL" "$SEL" "$activity" "$D" "$R"
+                    printf "\r\e[${C2}G%s│%s %-30s\e[${C3}G%s│%s %-13s\e[${C4}G%s│%s %-13s\e[${C5}G%s│%s\r" \
+                        "$D" "$SEL" "${dsp_text[i]}" \
+                        "$D" "$SEL" "$created" \
+                        "$D" "$SEL" "$activity" "$D" "$R"
+                    printf "\r  %s│%s %s \e[${C2}G" "$D" "$SEL" "$dot"
+                    printf "\r\n"
                 else
-                    printf '  %s│ %s%s%s │ %s%-28s%s │ %s%-12s%s │ %s%-12s%s %s│%s\r\n' \
-                        "$D" "$dc" "$dot" "$R" \
-                        "$nc" "${dsp_text[i]}" "$R" \
-                        "$Y" "$created" "$R" \
-                        "$Y" "$activity" "$R" "$D" "$R"
+                    printf "\r\e[${C2}G%s│%s %-30s\e[${C3}G%s│%s %-13s\e[${C4}G%s│%s %-13s\e[${C5}G%s│%s\r" \
+                        "$D" "$nc" "${dsp_text[i]}" \
+                        "$D" "$Y" "$created" \
+                        "$D" "$Y" "$activity" "$D" "$R"
+                    printf "\r  %s│ %s%s%s \e[${C2}G" "$D" "$dc" "$dot" "$R"
+                    printf "\r\n"
                 fi
                 ((line++))
                 ;;
         esac
     done
 
-    # bottom border
-    printf '  %s└─%-2s─┴─%-28s─┴─%-12s─┴─%-12s─┘%s\r\n' \
-        "$D" "──" "────────────────────────────" "────────────" "────────────" "$R"
+    printf '%s\r\n' "$bot"
     ((line++))
 
     printf '\r\n'

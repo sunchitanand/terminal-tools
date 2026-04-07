@@ -3,6 +3,7 @@
 ## Repo Info
 - **Repo**: https://github.com/sunchitanand/terminal-tools
 - **Local path**: ~/Documents/projects/terminal-tools
+- **Quick access**: `tt` alias (defined in ~/.zshrc)
 - **Scripts live at**: ~/.local/bin (symlinked from repo)
 
 ## Adding a New Script

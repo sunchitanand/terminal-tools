@@ -353,7 +353,7 @@ draw() {
                         "$D" "$SEL" "${dsp_text[i]}" \
                         "$D" "$SEL" "$created" \
                         "$D" "$SEL" "$activity" "$D" "$R"
-                    printf "\r  %s│%s %s \e[${C2}G" "$D" "$SEL" "$dot"
+                    printf "\r  %s│%s %s %s\e[${C2}G" "$D" "$SEL" "$dot" "$R"
                     printf "\r\n"
                 else
                     printf "\r\e[${C2}G%s│%s %-30s\e[${C3}G%s│%s %-13s\e[${C4}G%s│%s %-13s\e[${C5}G%s│%s\r" \

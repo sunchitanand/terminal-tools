@@ -4,6 +4,13 @@ SSH_OPTS=(-o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o LogLevel=ERROR)
 RTMUX='PATH=/apollo/env/envImprovement/bin:$PATH tmux -u'
 CONFIG="$HOME/.tmux-projects.json"
 
+# Use mosh for the final attach/new if USE_MOSH=1 or --mosh flag
+if [[ "$2" == "--mosh" ]] || [[ "$USE_MOSH" == "1" ]]; then
+    CONNECT_CMD=(mosh $HOST --)
+else
+    CONNECT_CMD=(ssh $SSH_OPTS -t $HOST)
+fi
+
 C=$'\e[36m' M=$'\e[35m' G=$'\e[32m' Y=$'\e[33m' D=$'\e[90m' R=$'\e[0m' B=$'\e[1m'
 SEL=$'\e[44;97m' ON=$'\e[32m●\e[0m' OFF=$'\e[90m○\e[0m' HI=$'\e[43;30m'
 
@@ -439,17 +446,17 @@ while true; do
                     printf '\n  %sSession name (project/name):%s ' "$C" "$R"
                     read -r new_name
                     if [[ -n "$new_name" ]]; then
-                        cleanup; exec ssh $SSH_OPTS -t $HOST "$RTMUX new -s \"$new_name\""
+                        cleanup; exec $CONNECT_CMD "$RTMUX new -s \"$new_name\""
                     fi
                     stty -echo raw; printf '\e[?25l'
                 elif is_current_running; then
-                    cleanup; exec ssh $SSH_OPTS -t $HOST "$RTMUX attach -t \"$(current_session_name)\""
+                    cleanup; exec $CONNECT_CMD "$RTMUX attach -t \"$(current_session_name)\""
                 else
                     local dir="$(current_session_dir)"
                     local name="$(current_session_name)"
                     local cd_cmd=""
                     [[ -n "$dir" ]] && cd_cmd="cd $dir &&"
-                    cleanup; exec ssh $SSH_OPTS -t $HOST "$RTMUX new -s \"$name\" '$cd_cmd exec \$SHELL'"
+                    cleanup; exec $CONNECT_CMD "$RTMUX new -s \"$name\" '$cd_cmd exec \$SHELL'"
                 fi ;;
             $'\x7f'|$'\b')
                 if [[ -n "$search" ]]; then
@@ -473,17 +480,17 @@ while true; do
                     printf '\n  %sSession name (project/name):%s ' "$C" "$R"
                     read -r new_name
                     if [[ -n "$new_name" ]]; then
-                        cleanup; exec ssh $SSH_OPTS -t $HOST "$RTMUX new -s \"$new_name\""
+                        cleanup; exec $CONNECT_CMD "$RTMUX new -s \"$new_name\""
                     fi
                     stty -echo raw; printf '\e[?25l'
                 elif is_current_running; then
-                    cleanup; exec ssh $SSH_OPTS -t $HOST "$RTMUX attach -t \"$(current_session_name)\""
+                    cleanup; exec $CONNECT_CMD "$RTMUX attach -t \"$(current_session_name)\""
                 else
                     local dir="$(current_session_dir)"
                     local name="$(current_session_name)"
                     local cd_cmd=""
                     [[ -n "$dir" ]] && cd_cmd="cd $dir &&"
-                    cleanup; exec ssh $SSH_OPTS -t $HOST "$RTMUX new -s \"$name\" '$cd_cmd exec \$SHELL'"
+                    cleanup; exec $CONNECT_CMD "$RTMUX new -s \"$name\" '$cd_cmd exec \$SHELL'"
                 fi ;;
             ' ')
                 if ! is_on_new; then

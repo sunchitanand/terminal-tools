@@ -6,7 +6,7 @@ CONFIG="$HOME/.tmux-projects.json"
 
 # If inside cmux, add socket forwarding to all SSH connections
 if [[ -n "${CMUX_SOCKET_PATH:-}" && -S "${CMUX_SOCKET_PATH:-}" ]]; then
-    CMUX_REMOTE_SOCK="/tmp/cmux-fwd-$$.sock"
+    CMUX_REMOTE_SOCK="/tmp/cmux-fwd.sock"
     # SSH -R can't handle spaces in socket paths — use a symlink
     CMUX_LOCAL_SOCK="/tmp/cmux-local-$$.sock"
     ln -sf "${CMUX_SOCKET_PATH}" "$CMUX_LOCAL_SOCK"
@@ -93,6 +93,7 @@ fetch_sessions() {
         cmux_setup+="$RTMUX set-environment -g CMUX_WORKSPACE_ID '${CMUX_WORKSPACE_ID:-}' 2>/dev/null;"
         cmux_setup+="$RTMUX set-environment -g CMUX_TAB_ID '${CMUX_TAB_ID:-}' 2>/dev/null;"
         cmux_setup+="$RTMUX set-environment -g CMUX_SURFACE_ID '${CMUX_SURFACE_ID:-}' 2>/dev/null;"
+        cmux_setup+="$RTMUX set-option -g update-environment 'CMUX_SOCKET_PATH CMUX_WORKSPACE_ID CMUX_TAB_ID CMUX_SURFACE_ID' 2>/dev/null;"
     fi
 
     raw=$(ssh $SSH_OPTS $HOST "

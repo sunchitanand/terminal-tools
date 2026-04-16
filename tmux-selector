@@ -6,8 +6,11 @@ CONFIG="$HOME/.tmux-projects.json"
 
 # If inside cmux, add socket forwarding to all SSH connections
 if [[ -n "${CMUX_SOCKET_PATH:-}" && -S "${CMUX_SOCKET_PATH:-}" ]]; then
-    CMUX_REMOTE_SOCK="/tmp/cmux-$(id -u).sock"
-    SSH_OPTS+=(-o StreamLocalBindUnlink=yes -R "$CMUX_REMOTE_SOCK:$CMUX_SOCKET_PATH")
+    CMUX_REMOTE_SOCK="/tmp/cmux-fwd-$$.sock"
+    # SSH -R can't handle spaces in socket paths — use a symlink
+    CMUX_LOCAL_SOCK="/tmp/cmux-local-$$.sock"
+    ln -sf "${CMUX_SOCKET_PATH}" "$CMUX_LOCAL_SOCK"
+    SSH_OPTS+=(-o StreamLocalBindUnlink=yes -R "${CMUX_REMOTE_SOCK}:${CMUX_LOCAL_SOCK}")
 fi
 
 # Use mosh for the final attach/new if USE_MOSH=1 or --mosh flag
@@ -21,7 +24,10 @@ run_remote() {
     if [[ $USE_MOSH -eq 1 ]]; then
         exec mosh "$HOST" -- bash -lc "$1"
     else
-        exec ssh $SSH_OPTS -t "$HOST" "$1"
+        # Disable ControlMaster so -R socket forwarding works on this connection
+        local opts=($SSH_OPTS)
+        [[ -n "${CMUX_REMOTE_SOCK:-}" ]] && opts+=(-o ControlPath=none)
+        exec ssh $opts -t "$HOST" "$1"
     fi
 }
 

@@ -11,28 +11,20 @@ if [[ "$2" == "--mosh" ]] || [[ "$USE_MOSH" == "1" ]]; then
 fi
 
 # Run a remote command
-# Uses kmux ssh if inside cmux (for sidebar integration), otherwise plain ssh
 run_remote() {
     if [[ $USE_MOSH -eq 1 ]]; then
         exec mosh "$HOST" -- bash -lc "$1"
-    elif [[ -n "${CMUX_SOCKET_PATH:-}" ]] && command -v kmux &>/dev/null; then
-        # Inside cmux — use kmux ssh for sidebar integration
-        # Extract session name from tmux attach/new command
-        local sess=""
-        if [[ "$1" == *"attach -t"* ]]; then
-            sess="${1##*attach -t \"}"
-            sess="${sess%%\"*}"
-        elif [[ "$1" == *"new -s"* ]]; then
-            sess="${1##*new -s \"}"
-            sess="${sess%%\"*}"
-        fi
-        if [[ -n "$sess" ]]; then
-            exec kmux ssh "$HOST" --tmux="$sess"
-        else
-            exec kmux ssh "$HOST" --tmux
-        fi
     else
-        exec ssh $SSH_OPTS -t "$HOST" "$1"
+        # If inside cmux, forward the socket for sidebar integration
+        local extra_opts=()
+        if [[ -n "${CMUX_SOCKET_PATH:-}" && -S "${CMUX_SOCKET_PATH:-}" ]]; then
+            local remote_sock="/tmp/cmux-$(id -u).sock"
+            extra_opts+=(-o StreamLocalBindUnlink=yes -R "$remote_sock:$CMUX_SOCKET_PATH")
+            # Prepend env export so tmux sessions can find the socket
+            exec ssh $SSH_OPTS "${extra_opts[@]}" -t "$HOST" "export CMUX_SOCKET_PATH=$remote_sock CMUX_WORKSPACE_ID=${CMUX_WORKSPACE_ID:-} CMUX_TAB_ID=${CMUX_TAB_ID:-} CMUX_SURFACE_ID=${CMUX_SURFACE_ID:-}; PATH=/usr/local/bin:\$PATH tmux set-environment -g CMUX_SOCKET_PATH $remote_sock 2>/dev/null; $1"
+        else
+            exec ssh $SSH_OPTS -t "$HOST" "$1"
+        fi
     fi
 }
 

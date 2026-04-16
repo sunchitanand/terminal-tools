@@ -4,21 +4,6 @@ SSH_OPTS=(-o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o LogLevel=ERROR)
 RTMUX='PATH=/usr/local/bin:/apollo/env/envImprovement/bin:$PATH tmux -u'
 CONFIG="$HOME/.tmux-projects.json"
 
-# cmux socket forwarding for sidebar integration
-CMUX_SOCK="${CMUX_SOCKET_PATH:-}"
-REMOTE_SOCK="/tmp/cmux-$(id -u).sock"
-if [[ -S "$CMUX_SOCK" ]]; then
-    SSH_OPTS+=(-o StreamLocalBindUnlink=yes -R "$REMOTE_SOCK:$CMUX_SOCK")
-    # Export cmux env vars into remote tmux sessions
-    CMUX_ENV="export CMUX_SOCKET_PATH=$REMOTE_SOCK"
-    for var in CMUX_WORKSPACE_ID CMUX_TAB_ID CMUX_PANEL_ID CMUX_SURFACE_ID; do
-        [[ -n "${(P)var:-}" ]] && CMUX_ENV+=" $var=${(P)var}"
-    done
-    CMUX_ENV+="; "
-else
-    CMUX_ENV=""
-fi
-
 # Use mosh for the final attach/new if USE_MOSH=1 or --mosh flag
 USE_MOSH=0
 if [[ "$2" == "--mosh" ]] || [[ "$USE_MOSH" == "1" ]]; then
@@ -30,7 +15,7 @@ run_remote() {
     if [[ $USE_MOSH -eq 1 ]]; then
         exec mosh "$HOST" -- bash -lc "$1"
     else
-        exec ssh $SSH_OPTS -t "$HOST" "${CMUX_ENV}$1"
+        exec ssh $SSH_OPTS -t "$HOST" "$1"
     fi
 }
 

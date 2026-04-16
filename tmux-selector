@@ -15,16 +15,7 @@ run_remote() {
     if [[ $USE_MOSH -eq 1 ]]; then
         exec mosh "$HOST" -- bash -lc "$1"
     else
-        # If inside cmux, forward the socket for sidebar integration
-        local extra_opts=()
-        if [[ -n "${CMUX_SOCKET_PATH:-}" && -S "${CMUX_SOCKET_PATH:-}" ]]; then
-            local remote_sock="/tmp/cmux-$(id -u).sock"
-            extra_opts+=(-o StreamLocalBindUnlink=yes -R "$remote_sock:$CMUX_SOCKET_PATH")
-            # Prepend env export so tmux sessions can find the socket
-            exec ssh $SSH_OPTS "${extra_opts[@]}" -t "$HOST" "export CMUX_SOCKET_PATH=$remote_sock CMUX_WORKSPACE_ID=${CMUX_WORKSPACE_ID:-} CMUX_TAB_ID=${CMUX_TAB_ID:-} CMUX_SURFACE_ID=${CMUX_SURFACE_ID:-}; PATH=/usr/local/bin:\$PATH tmux set-environment -g CMUX_SOCKET_PATH $remote_sock 2>/dev/null; $1"
-        else
-            exec ssh $SSH_OPTS -t "$HOST" "$1"
-        fi
+        exec ssh $SSH_OPTS -t "$HOST" "$1"
     fi
 }
 

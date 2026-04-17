@@ -45,7 +45,7 @@ run_remote() {
             [[ "$cmd" == *"attach -t"* ]] && sess=$(echo "$cmd" | sed 's/.*attach -t "\{0,1\}\([^"]*\)"\{0,1\}.*/\1/')
             [[ "$cmd" == *"new -s"* ]] && sess=$(echo "$cmd" | sed 's/.*new -s "\{0,1\}\([^"]*\)"\{0,1\}.*/\1/')
             if [[ -n "$sess" ]]; then
-                local se="$RTMUX set-environment -t '$sess'"
+                local se="$RTMUX set-environment -t '=$sess'"
                 cmd="$se CMUX_SOCKET_PATH '/tmp/cmux.sock' 2>/dev/null; $se CMUX_WORKSPACE_ID '${CMUX_WORKSPACE_ID:-}' 2>/dev/null; $se CMUX_TAB_ID '${CMUX_TAB_ID:-}' 2>/dev/null; $se CMUX_PANEL_ID '${CMUX_PANEL_ID:-}' 2>/dev/null; $se CMUX_SURFACE_ID '${CMUX_SURFACE_ID:-}' 2>/dev/null; $cmd"
             fi
         fi

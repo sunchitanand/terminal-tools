@@ -10,12 +10,26 @@ if [[ "$2" == "--mosh" ]] || [[ "$USE_MOSH" == "1" ]]; then
     USE_MOSH=1
 fi
 
+# Build cmux env prefix for remote commands
+CMUX_PREFIX=""
+CMUX_SSH_EXTRA=()
+if [[ -n "${CMUX_SOCKET_PATH:-}" && -S "${CMUX_SOCKET_PATH:-}" ]] || [[ -S "$HOME/Library/Application Support/cmux/cmux.sock" ]]; then
+    local sock="${CMUX_SOCKET_PATH:-$HOME/Library/Application Support/cmux/cmux.sock}"
+    local remote_sock="/tmp/cmux.sock"
+    CMUX_SSH_EXTRA=(-o StreamLocalBindUnlink=yes -o ControlPath=none -R "$remote_sock:$sock")
+    CMUX_PREFIX="export CMUX_SOCKET_PATH=$remote_sock"
+    CMUX_PREFIX+=" CMUX_WORKSPACE_ID=${CMUX_WORKSPACE_ID:-}"
+    CMUX_PREFIX+=" CMUX_TAB_ID=${CMUX_TAB_ID:-}"
+    CMUX_PREFIX+=" CMUX_PANEL_ID=${CMUX_PANEL_ID:-}"
+    CMUX_PREFIX+=" CMUX_SURFACE_ID=${CMUX_SURFACE_ID:-};"
+fi
+
 # Run a remote command
 run_remote() {
     if [[ $USE_MOSH -eq 1 ]]; then
         exec mosh "$HOST" -- bash -lc "$1"
     else
-        exec ssh $SSH_OPTS -t "$HOST" "$1"
+        exec ssh $SSH_OPTS $CMUX_SSH_EXTRA -t "$HOST" "${CMUX_PREFIX} $1"
     fi
 }
 
@@ -75,6 +89,7 @@ fetch_sessions() {
 
     local raw
     raw=$(ssh $SSH_OPTS $HOST "
+        rm -f /tmp/cmux.sock 2>/dev/null
         $RTMUX ls -F '#{session_name}|#{session_created}|#{session_activity}' 2>/dev/null
         echo '==='
         $RTMUX ls -F '#{session_name}|#{pane_current_path}' 2>/dev/null

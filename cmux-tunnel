@@ -1,0 +1,76 @@
+#!/usr/bin/env zsh
+# cmux-tunnel — persistent SSH tunnel for cmux socket forwarding
+# Keeps the cmux socket alive on a remote host independently of tmux sessions.
+# Usage: cmux-tunnel <host>
+#        cmux-tunnel stop <host>
+
+HOST="${1:-}"
+REMOTE_SOCK="/tmp/cmux-fwd.sock"
+LOCAL_SOCK="${CMUX_SOCKET_PATH:-}"
+PID_DIR="$HOME/.cmux-tunnels"
+
+[[ -z "$HOST" ]] && { echo "Usage: cmux-tunnel <host>"; exit 1; }
+
+mkdir -p "$PID_DIR"
+PID_FILE="$PID_DIR/$(echo "$HOST" | tr '/' '_').pid"
+
+# Stop command
+if [[ "$HOST" == "stop" ]]; then
+    HOST="${2:-}"
+    [[ -z "$HOST" ]] && { echo "Usage: cmux-tunnel stop <host>"; exit 1; }
+    PID_FILE="$PID_DIR/$(echo "$HOST" | tr '/' '_').pid"
+    if [[ -f "$PID_FILE" ]]; then
+        kill "$(cat "$PID_FILE")" 2>/dev/null
+        rm -f "$PID_FILE"
+        echo "Stopped tunnel to $HOST"
+    else
+        echo "No tunnel running for $HOST"
+    fi
+    exit 0
+fi
+
+# Check we're inside cmux
+if [[ -z "$LOCAL_SOCK" || ! -S "$LOCAL_SOCK" ]]; then
+    echo "Not inside cmux (CMUX_SOCKET_PATH not set)"
+    exit 1
+fi
+
+# Kill existing tunnel for this host
+[[ -f "$PID_FILE" ]] && kill "$(cat "$PID_FILE")" 2>/dev/null
+
+# Create symlink to avoid spaces in path
+LOCAL_LINK="/tmp/cmux-tunnel-$$.sock"
+ln -sf "$LOCAL_SOCK" "$LOCAL_LINK"
+
+# Start persistent tunnel in background
+(
+    while true; do
+        ssh -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -o ExitOnForwardFailure=yes \
+            -o StreamLocalBindUnlink=yes \
+            -o ControlPath=none \
+            -o LogLevel=ERROR \
+            -N \
+            -R "${REMOTE_SOCK}:${LOCAL_LINK}" \
+            "$HOST" 2>/dev/null
+        # Reconnect after 2 seconds if connection drops
+        sleep 2
+    done
+) &
+TUNNEL_PID=$!
+disown $TUNNEL_PID
+echo "$TUNNEL_PID" > "$PID_FILE"
+
+# Also set tmux env on the remote
+ssh -o LogLevel=ERROR "$HOST" "
+    PATH=/usr/local/bin:\$PATH
+    tmux set-environment -g CMUX_SOCKET_PATH '$REMOTE_SOCK' 2>/dev/null
+    tmux set-environment -g CMUX_WORKSPACE_ID '${CMUX_WORKSPACE_ID:-}' 2>/dev/null
+    tmux set-environment -g CMUX_TAB_ID '${CMUX_TAB_ID:-}' 2>/dev/null
+    tmux set-environment -g CMUX_SURFACE_ID '${CMUX_SURFACE_ID:-}' 2>/dev/null
+" 2>/dev/null
+
+echo "Tunnel to $HOST started (PID $TUNNEL_PID)"
+echo "Remote socket: $REMOTE_SOCK"
+echo "Tunnel auto-reconnects on disconnect"

@@ -4,15 +4,6 @@ SSH_OPTS=(-o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o LogLevel=ERROR)
 RTMUX='PATH=/usr/local/bin:/apollo/env/envImprovement/bin:$PATH tmux -u'
 CONFIG="$HOME/.tmux-projects.json"
 
-# If inside cmux, add socket forwarding to all SSH connections
-if [[ -n "${CMUX_SOCKET_PATH:-}" && -S "${CMUX_SOCKET_PATH:-}" ]]; then
-    CMUX_REMOTE_SOCK="/tmp/cmux-fwd.sock"
-    # SSH -R can't handle spaces in socket paths — use a symlink
-    CMUX_LOCAL_SOCK="/tmp/cmux-local-$$.sock"
-    ln -sf "${CMUX_SOCKET_PATH}" "$CMUX_LOCAL_SOCK"
-    SSH_OPTS+=(-o StreamLocalBindUnlink=yes -R "${CMUX_REMOTE_SOCK}:${CMUX_LOCAL_SOCK}")
-fi
-
 # Use mosh for the final attach/new if USE_MOSH=1 or --mosh flag
 USE_MOSH=0
 if [[ "$2" == "--mosh" ]] || [[ "$USE_MOSH" == "1" ]]; then
@@ -24,10 +15,7 @@ run_remote() {
     if [[ $USE_MOSH -eq 1 ]]; then
         exec mosh "$HOST" -- bash -lc "$1"
     else
-        # Disable ControlMaster so -R socket forwarding works on this connection
-        local opts=($SSH_OPTS)
-        [[ -n "${CMUX_REMOTE_SOCK:-}" ]] && opts+=(-o ControlPath=none)
-        exec ssh $opts -t "$HOST" "$1"
+        exec ssh $SSH_OPTS -t "$HOST" "$1"
     fi
 }
 
@@ -86,18 +74,7 @@ fetch_sessions() {
     sess_names=(); sess_running=(); sess_created=(); sess_activity=(); sess_dirs=()
 
     local raw
-    # If inside cmux, inject socket path into tmux's global env
-    local cmux_setup=""
-    if [[ -n "${CMUX_REMOTE_SOCK:-}" ]]; then
-        cmux_setup="$RTMUX set-environment -g CMUX_SOCKET_PATH '$CMUX_REMOTE_SOCK' 2>/dev/null;"
-        cmux_setup+="$RTMUX set-environment -g CMUX_WORKSPACE_ID '${CMUX_WORKSPACE_ID:-}' 2>/dev/null;"
-        cmux_setup+="$RTMUX set-environment -g CMUX_TAB_ID '${CMUX_TAB_ID:-}' 2>/dev/null;"
-        cmux_setup+="$RTMUX set-environment -g CMUX_SURFACE_ID '${CMUX_SURFACE_ID:-}' 2>/dev/null;"
-        cmux_setup+="$RTMUX set-option -g update-environment 'CMUX_SOCKET_PATH CMUX_WORKSPACE_ID CMUX_TAB_ID CMUX_SURFACE_ID' 2>/dev/null;"
-    fi
-
     raw=$(ssh $SSH_OPTS $HOST "
-        $cmux_setup
         $RTMUX ls -F '#{session_name}|#{session_created}|#{session_activity}' 2>/dev/null
         echo '==='
         $RTMUX ls -F '#{session_name}|#{pane_current_path}' 2>/dev/null

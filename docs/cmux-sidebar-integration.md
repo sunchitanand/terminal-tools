@@ -1,17 +1,31 @@
-# cmux Sidebar Integration with tmux-selector
+# cmux + Kiro Integration with tmux-selector
 
 ## How it works
 
 When you run `c3`/`c2`/`ccc` from inside cmux, the tmux-selector script:
-1. Detects `CMUX_SOCKET_PATH` env var (set by cmux)
-2. Creates a local symlink to the cmux socket (workaround for spaces in path)
-3. Adds `-R /tmp/cmux-fwd.sock:<local-socket>` to SSH opts (reverse-forwards the socket)
-4. During session fetch, sets `CMUX_SOCKET_PATH=/tmp/cmux-fwd.sock` in tmux's global environment
-5. Attaches to your chosen tmux session with the socket forwarded
+1. Detects cmux socket (from `CMUX_SOCKET_PATH` or default location)
+2. Adds `-R /tmp/cmux.sock:<local-socket>` to SSH opts (reverse-forwards the socket)
+3. Passes all CMUX env vars (`WORKSPACE_ID`, `TAB_ID`, `PANEL_ID`, `SURFACE_ID`) to the remote shell
+4. Sets per-session tmux environment so new panes inherit the vars
+5. A `precmd` hook on the remote auto-refreshes CMUX vars from tmux env on every prompt
 
-Kiro sessions inside tmux can then talk to cmux via the forwarded socket → sidebar updates, titles, notifications.
+Kiro sessions inside tmux talk to cmux via the forwarded socket → sidebar updates, titles, notifications.
 
-## One-time setup per remote host
+When run outside cmux (e.g. iTerm2), the script works normally without sidebar integration.
+
+## One-time setup
+
+### 1. Install kiro-cmux locally (on Mac)
+
+```bash
+[[ "$(curl -s -b ~/.midway/cookie https://midway-auth.amazon.com/api/session-status 2>/dev/null | jq -r .authenticated)" == "true" ]] || mwinit
+git clone ssh://git.amazon.com/pkg/AmznCmuxKiroTools ~/.cmux-kiro
+~/.cmux-kiro/setup.sh
+```
+
+Select all agents when prompted. This injects cmux hooks into all your kiro agent configs.
+
+### 2. Setup each remote host
 
 ```bash
 # From inside cmux on your Mac:
@@ -20,79 +34,73 @@ kmux setup-remote dev-dsk-sunchit-2a-0fd3f6d1.us-west-2.amazon.com
 kmux setup-remote sunchit-cd2.aka.corp.amazon.com
 ```
 
-This installs:
-- cmux/nc shims in `~/bin/` on the remote
-- kiro-cmux hooks into all agent configs
-- kask (warm ACP client for fast AI titles/notifications)
-- CR detection
+Then SSH into each host and run `~/.cmux-kiro/setup.sh` to inject hooks into remote agents (the interactive picker needs a real terminal).
+
+### 3. Verify hooks are injected
+
+```bash
+# On remote:
+grep -c "cmux" ~/.kiro/agents/AmazonBuilderCoreAIAgents-amzn-builder.json
+# Should be > 0
+```
 
 ## Daily usage
 
 ```bash
 # From cmux terminal on Mac:
-c3                          # opens tmux-selector, pick a session
-# Inside the remote tmux session:
-export CMUX_SOCKET_PATH=/tmp/cmux-fwd.sock   # needed for existing sessions
-k                           # start kiro with sidebar integration
+c3                    # tmux-selector, pick a session
+# Inside remote tmux:
+k                     # start kiro — sidebar updates automatically
 ```
 
-New tmux panes/windows automatically inherit `CMUX_SOCKET_PATH` — no export needed.
+New tmux panes inherit CMUX vars automatically. Existing panes refresh vars on next prompt (via precmd hook).
 
-## For existing sessions (first time after connecting)
+## How multiple sessions work
 
-Existing shells don't inherit the env var. Run once per pane:
-```bash
-export CMUX_SOCKET_PATH=/tmp/cmux-fwd.sock
-```
+- Each cmux workspace has its own `WORKSPACE_ID`, `TAB_ID`, `PANEL_ID`
+- When you `c3` from workspace A → session X gets workspace A's IDs
+- When you `c3` from workspace B → session Y gets workspace B's IDs
+- IDs are set per-tmux-session (not global), so they don't overwrite each other
+- The `precmd` hook refreshes vars from tmux session env on every prompt
 
-Then restart kiro (`k` or `kiro-cli chat --resume`).
-
-Or broadcast to all panes at once:
-```bash
-for pane in $(PATH=/usr/local/bin:$PATH tmux list-panes -a -F '#{pane_id}'); do
-    PATH=/usr/local/bin:$PATH tmux send-keys -t "$pane" "export CMUX_SOCKET_PATH=/tmp/cmux-fwd.sock" Enter
-done
-```
+**Caveat**: All panes within the same tmux session share one set of IDs → one sidebar entry. For separate sidebar tracking per kiro session, use separate cmux workspaces.
 
 ## Verify it works
 
+On the remote, inside tmux:
 ```bash
-# On the remote, inside tmux:
-~/bin/cmux ping              # should say PONG
-echo $CMUX_SOCKET_PATH       # should say /tmp/cmux-fwd.sock
+echo "WS=$CMUX_WORKSPACE_ID TAB=$CMUX_TAB_ID PANEL=$CMUX_PANEL_ID"
+~/bin/cmux ping                    # should say PONG
+~/bin/cmux notify --title "test" --body "hello"   # should appear in cmux sidebar
 ```
 
 ## Troubleshooting
 
 | Problem | Fix |
 |---|---|
-| `cmux ping` says "Connection refused" | Detach tmux, exit SSH, reconnect via `c3` — socket forward needs a fresh connection |
-| `CMUX_SOCKET_PATH` is empty | Run `export CMUX_SOCKET_PATH=/tmp/cmux-fwd.sock` or open a new tmux pane |
-| `/tmp/cmux-fwd.sock` doesn't exist | You connected from outside cmux (iTerm2 etc.) — reconnect from cmux |
-| Sidebar not updating after starting kiro | Stop kiro, verify `cmux ping` works, restart kiro |
-| `setup-remote` says "All agents already have cmux hooks" but they don't | SSH into the host and run `~/.cmux-kiro/setup.sh` manually, select all agents |
+| `cmux ping` → "Connection refused" | Detach tmux, reconnect via `c3` — socket forward needs fresh SSH connection |
+| `cmux ping` → "No such file or directory" | Socket not forwarded — make sure you ran `c3` from cmux (not iTerm2) |
+| `CMUX_TAB_ID` empty | Open a new tmux pane (`Ctrl+B %`) or run `source ~/.zshrc` |
+| Sidebar updates go to wrong workspace | The tmux session has stale IDs — detach and reconnect via `c3` from the correct cmux workspace |
+| Hooks not firing | Check agent has hooks: `grep -c "cmux" ~/.kiro/agents/<agent>.json`. If 0, run `~/.cmux-kiro/setup.sh` |
+| `amzn-builder` has no hooks | Run `~/.cmux-kiro/setup.sh` and select it in the picker |
+| Local kiro sidebar not working | Same fix — run `~/.cmux-kiro/setup.sh` locally, select all agents |
 
-## What the tmux-selector script does (technical)
+## Technical details
 
-In `tmux-selector`, at the top:
+### tmux-selector changes
+
+In `run_remote()`, when inside cmux:
+- SSH gets `-o StreamLocalBindUnlink=yes -o ControlPath=none -R /tmp/cmux.sock:<local_socket>`
+- `CMUX_PREFIX` exports all env vars into the remote shell
+- Per-session `tmux set-environment -t '=<session>'` sets vars for new panes
+- `update-environment` config tells tmux to refresh on reattach
+
+### Remote precmd hook (in ~/.zshrc)
+
 ```bash
-# If inside cmux, add socket forwarding to all SSH connections
-if [[ -n "${CMUX_SOCKET_PATH:-}" && -S "${CMUX_SOCKET_PATH:-}" ]]; then
-    CMUX_REMOTE_SOCK="/tmp/cmux-fwd.sock"
-    CMUX_LOCAL_SOCK="/tmp/cmux-local-$$.sock"
-    ln -sf "${CMUX_SOCKET_PATH}" "$CMUX_LOCAL_SOCK"
-    SSH_OPTS+=(-o StreamLocalBindUnlink=yes -R "${CMUX_REMOTE_SOCK}:${CMUX_LOCAL_SOCK}")
-fi
+cmux_refresh_env() { eval $(PATH=/usr/local/bin:$PATH tmux show-environment -s 2>/dev/null | grep CMUX) 2>/dev/null; }
+precmd_functions+=(cmux_refresh_env)
 ```
 
-During fetch, injects env into tmux:
-```bash
-tmux set-environment -g CMUX_SOCKET_PATH '/tmp/cmux-fwd.sock'
-tmux set-environment -g CMUX_WORKSPACE_ID '...'
-tmux set-option -g update-environment 'CMUX_SOCKET_PATH CMUX_WORKSPACE_ID ...'
-```
-
-During attach, disables ControlMaster so the `-R` forward works:
-```bash
-ssh -o ControlPath=none $SSH_OPTS -t $HOST "tmux attach ..."
-```
+Auto-refreshes CMUX vars from tmux session environment on every prompt.

@@ -1,75 +1,64 @@
 #!/usr/bin/env zsh
 # cmux-tunnel — persistent SSH tunnel for cmux socket forwarding
-# Keeps the cmux socket alive on a remote host independently of tmux sessions.
 # Usage: cmux-tunnel <host>
-#        cmux-tunnel stop <host>
+#        cmux-tunnel stop [host]
+#        cmux-tunnel status
 
 HOST="${1:-}"
-REMOTE_SOCK="/tmp/cmux-fwd.sock"
-LOCAL_SOCK="${CMUX_SOCKET_PATH:-}"
+REMOTE_SOCK="/tmp/cmux.sock"
+LOCAL_SOCK="${CMUX_SOCKET_PATH:-$HOME/Library/Application Support/cmux/cmux.sock}"
 PID_DIR="$HOME/.cmux-tunnels"
 
-[[ -z "$HOST" ]] && { echo "Usage: cmux-tunnel <host>"; exit 1; }
-
 mkdir -p "$PID_DIR"
-PID_FILE="$PID_DIR/$(echo "$HOST" | tr '/' '_').pid"
 
-# Stop command
-if [[ "$HOST" == "stop" ]]; then
-    HOST="${2:-}"
-    [[ -z "$HOST" ]] && { echo "Usage: cmux-tunnel stop <host>"; exit 1; }
-    PID_FILE="$PID_DIR/$(echo "$HOST" | tr '/' '_').pid"
-    if [[ -f "$PID_FILE" ]]; then
-        kill "$(cat "$PID_FILE")" 2>/dev/null
-        rm -f "$PID_FILE"
-        echo "Stopped tunnel to $HOST"
-    else
-        echo "No tunnel running for $HOST"
-    fi
+if [[ "$HOST" == "status" ]]; then
+    for pf in "$PID_DIR"/*.pid(N); do
+        h=$(basename "$pf" .pid | tr '_' '.')
+        pid=$(cat "$pf")
+        kill -0 "$pid" 2>/dev/null && echo "✓ $h (PID $pid)" || { echo "✗ $h (dead)"; rm -f "$pf"; }
+    done
     exit 0
 fi
 
-# Check we're inside cmux
-if [[ -z "$LOCAL_SOCK" || ! -S "$LOCAL_SOCK" ]]; then
-    echo "Not inside cmux (CMUX_SOCKET_PATH not set)"
-    exit 1
+if [[ "$HOST" == "stop" ]]; then
+    HOST="${2:-}"
+    if [[ -z "$HOST" ]]; then
+        for pf in "$PID_DIR"/*.pid(N); do kill "$(cat "$pf")" 2>/dev/null; rm -f "$pf"; done
+        echo "Stopped all tunnels"; exit 0
+    fi
+    PID_FILE="$PID_DIR/$(echo "$HOST" | tr '/' '_').pid"
+    [[ -f "$PID_FILE" ]] && kill "$(cat "$PID_FILE")" 2>/dev/null && rm -f "$PID_FILE" && echo "Stopped $HOST" || echo "No tunnel for $HOST"
+    exit 0
 fi
 
-# Kill existing tunnel for this host
+[[ -z "$HOST" ]] && { echo "Usage: cmux-tunnel <host> | stop [host] | status"; exit 1; }
+[[ ! -S "$LOCAL_SOCK" ]] && { echo "cmux socket not found at $LOCAL_SOCK"; exit 1; }
+
+PID_FILE="$PID_DIR/$(echo "$HOST" | tr '/' '_').pid"
 [[ -f "$PID_FILE" ]] && kill "$(cat "$PID_FILE")" 2>/dev/null
 
-# Create symlink to avoid spaces in path
-LOCAL_LINK="/tmp/cmux-tunnel-link.sock"
-ln -sf "$LOCAL_SOCK" "$LOCAL_LINK"
+# Clean stale socket, set tmux env, set shell env — one SSH call
+ssh -o ControlPath=none -o LogLevel=ERROR "$HOST" "
+    rm -f $REMOTE_SOCK
+    PATH=/usr/local/bin:\$PATH
+    tmux set-environment -g CMUX_SOCKET_PATH '$REMOTE_SOCK' 2>/dev/null
+    grep -q 'export CMUX_SOCKET_PATH=' ~/.zshrc 2>/dev/null && sed -i 's|export CMUX_SOCKET_PATH=.*|export CMUX_SOCKET_PATH=$REMOTE_SOCK|' ~/.zshrc || echo 'export CMUX_SOCKET_PATH=$REMOTE_SOCK' >> ~/.zshrc
+" 2>/dev/null
 
-# Start persistent tunnel in background
+# Start persistent tunnel — auto-reconnects, no port forwards from ssh_config
 (
     while true; do
         ssh -o ServerAliveInterval=15 \
             -o ServerAliveCountMax=3 \
-            -o ExitOnForwardFailure=yes \
             -o StreamLocalBindUnlink=yes \
             -o ControlPath=none \
             -o LogLevel=ERROR \
             -N \
-            -R "${REMOTE_SOCK}:${LOCAL_LINK}" \
+            -R "$REMOTE_SOCK:$LOCAL_SOCK" \
             "$HOST" 2>/dev/null
-        # Reconnect after 2 seconds if connection drops
         sleep 2
     done
 ) &!
 echo "$!" > "$PID_FILE"
 
-# Also set tmux env and shell env on the remote
-ssh -o LogLevel=ERROR "$HOST" "
-    PATH=/usr/local/bin:\$PATH
-    tmux set-environment -g CMUX_SOCKET_PATH '$REMOTE_SOCK' 2>/dev/null
-    tmux set-environment -g CMUX_WORKSPACE_ID '${CMUX_WORKSPACE_ID:-}' 2>/dev/null
-    tmux set-environment -g CMUX_TAB_ID '${CMUX_TAB_ID:-}' 2>/dev/null
-    tmux set-environment -g CMUX_SURFACE_ID '${CMUX_SURFACE_ID:-}' 2>/dev/null
-    grep -q 'CMUX_SOCKET_PATH=/tmp/cmux-fwd.sock' ~/.zshrc 2>/dev/null || echo 'export CMUX_SOCKET_PATH=/tmp/cmux-fwd.sock' >> ~/.zshrc
-" 2>/dev/null
-
-echo "Tunnel to $HOST started (PID $(cat "$PID_FILE"))"
-echo "Remote socket: $REMOTE_SOCK"
-echo "Tunnel auto-reconnects on disconnect"
+echo "✓ Tunnel to $HOST (PID $(cat "$PID_FILE"))"

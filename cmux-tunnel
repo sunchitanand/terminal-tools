@@ -39,7 +39,7 @@ fi
 [[ -f "$PID_FILE" ]] && kill "$(cat "$PID_FILE")" 2>/dev/null
 
 # Create symlink to avoid spaces in path
-LOCAL_LINK="/tmp/cmux-tunnel-$$.sock"
+LOCAL_LINK="/tmp/cmux-tunnel-link.sock"
 ln -sf "$LOCAL_SOCK" "$LOCAL_LINK"
 
 # Start persistent tunnel in background
@@ -57,20 +57,19 @@ ln -sf "$LOCAL_SOCK" "$LOCAL_LINK"
         # Reconnect after 2 seconds if connection drops
         sleep 2
     done
-) &
-TUNNEL_PID=$!
-disown $TUNNEL_PID
-echo "$TUNNEL_PID" > "$PID_FILE"
+) &!
+echo "$!" > "$PID_FILE"
 
-# Also set tmux env on the remote
+# Also set tmux env and shell env on the remote
 ssh -o LogLevel=ERROR "$HOST" "
     PATH=/usr/local/bin:\$PATH
     tmux set-environment -g CMUX_SOCKET_PATH '$REMOTE_SOCK' 2>/dev/null
     tmux set-environment -g CMUX_WORKSPACE_ID '${CMUX_WORKSPACE_ID:-}' 2>/dev/null
     tmux set-environment -g CMUX_TAB_ID '${CMUX_TAB_ID:-}' 2>/dev/null
     tmux set-environment -g CMUX_SURFACE_ID '${CMUX_SURFACE_ID:-}' 2>/dev/null
+    grep -q 'CMUX_SOCKET_PATH=/tmp/cmux-fwd.sock' ~/.zshrc 2>/dev/null || echo 'export CMUX_SOCKET_PATH=/tmp/cmux-fwd.sock' >> ~/.zshrc
 " 2>/dev/null
 
-echo "Tunnel to $HOST started (PID $TUNNEL_PID)"
+echo "Tunnel to $HOST started (PID $(cat "$PID_FILE"))"
 echo "Remote socket: $REMOTE_SOCK"
 echo "Tunnel auto-reconnects on disconnect"

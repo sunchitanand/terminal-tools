@@ -24,15 +24,12 @@ if [[ -n "${CMUX_SOCKET_PATH:-}" && -S "${CMUX_SOCKET_PATH:-}" ]] || [[ -S "$HOM
     CMUX_PREFIX+=" CMUX_SURFACE_ID=${CMUX_SURFACE_ID:-};"
 fi
 
-# Build tmux env setup command
+# Build tmux env setup command — per-session, not global
 CMUX_TMUX_ENV=""
 if [[ -n "$CMUX_PREFIX" ]]; then
     local rs="/tmp/cmux.sock"
+    # We use SESSION_PLACEHOLDER which gets replaced with the actual session name in run_remote
     CMUX_TMUX_ENV="$RTMUX set-environment -g CMUX_SOCKET_PATH '$rs' 2>/dev/null;"
-    CMUX_TMUX_ENV+="$RTMUX set-environment -g CMUX_WORKSPACE_ID '${CMUX_WORKSPACE_ID:-}' 2>/dev/null;"
-    CMUX_TMUX_ENV+="$RTMUX set-environment -g CMUX_TAB_ID '${CMUX_TAB_ID:-}' 2>/dev/null;"
-    CMUX_TMUX_ENV+="$RTMUX set-environment -g CMUX_PANEL_ID '${CMUX_PANEL_ID:-}' 2>/dev/null;"
-    CMUX_TMUX_ENV+="$RTMUX set-environment -g CMUX_SURFACE_ID '${CMUX_SURFACE_ID:-}' 2>/dev/null;"
     CMUX_TMUX_ENV+="$RTMUX set-option -g update-environment 'CMUX_SOCKET_PATH CMUX_WORKSPACE_ID CMUX_TAB_ID CMUX_PANEL_ID CMUX_SURFACE_ID' 2>/dev/null;"
 fi
 
@@ -41,7 +38,18 @@ run_remote() {
     if [[ $USE_MOSH -eq 1 ]]; then
         exec mosh "$HOST" -- bash -lc "$1"
     else
-        exec ssh $SSH_OPTS $CMUX_SSH_EXTRA -t "$HOST" "${CMUX_PREFIX} ${CMUX_TMUX_ENV} $1"
+        local cmd="$1"
+        # For tmux commands, set per-session CMUX env vars
+        if [[ -n "$CMUX_PREFIX" && "$cmd" == *"tmux"* ]]; then
+            local sess=""
+            [[ "$cmd" == *"attach -t"* ]] && sess=$(echo "$cmd" | sed 's/.*attach -t "\{0,1\}\([^"]*\)"\{0,1\}.*/\1/')
+            [[ "$cmd" == *"new -s"* ]] && sess=$(echo "$cmd" | sed 's/.*new -s "\{0,1\}\([^"]*\)"\{0,1\}.*/\1/')
+            if [[ -n "$sess" ]]; then
+                local se="$RTMUX set-environment -t '$sess'"
+                cmd="$se CMUX_SOCKET_PATH '/tmp/cmux.sock' 2>/dev/null; $se CMUX_WORKSPACE_ID '${CMUX_WORKSPACE_ID:-}' 2>/dev/null; $se CMUX_TAB_ID '${CMUX_TAB_ID:-}' 2>/dev/null; $se CMUX_PANEL_ID '${CMUX_PANEL_ID:-}' 2>/dev/null; $se CMUX_SURFACE_ID '${CMUX_SURFACE_ID:-}' 2>/dev/null; $cmd"
+            fi
+        fi
+        exec ssh $SSH_OPTS $CMUX_SSH_EXTRA -t "$HOST" "${CMUX_PREFIX} ${CMUX_TMUX_ENV} $cmd"
     fi
 }
 

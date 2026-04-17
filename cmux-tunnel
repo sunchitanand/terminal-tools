@@ -37,15 +37,30 @@ fi
 PID_FILE="$PID_DIR/$(echo "$HOST" | tr '/' '_').pid"
 [[ -f "$PID_FILE" ]] && kill "$(cat "$PID_FILE")" 2>/dev/null
 
-# Clean stale socket, set tmux env, set shell env — one SSH call
+# Get cmux env vars (from current env or query cmux)
+local ws_id="${CMUX_WORKSPACE_ID:-}"
+local tab_id="${CMUX_TAB_ID:-}"
+local panel_id="${CMUX_PANEL_ID:-}"
+local surface_id="${CMUX_SURFACE_ID:-}"
+
+# Build the export line for remote .zshrc
+EXPORT_LINE="export CMUX_SOCKET_PATH=$REMOTE_SOCK CMUX_WORKSPACE_ID=$ws_id CMUX_TAB_ID=$tab_id CMUX_PANEL_ID=$panel_id CMUX_SURFACE_ID=$surface_id"
+
+# Clean stale socket, set tmux env + shell env on remote
 ssh -o ControlPath=none -o LogLevel=ERROR "$HOST" "
     rm -f $REMOTE_SOCK
     PATH=/usr/local/bin:\$PATH
     tmux set-environment -g CMUX_SOCKET_PATH '$REMOTE_SOCK' 2>/dev/null
-    grep -q 'export CMUX_SOCKET_PATH=' ~/.zshrc 2>/dev/null && sed -i 's|export CMUX_SOCKET_PATH=.*|export CMUX_SOCKET_PATH=$REMOTE_SOCK|' ~/.zshrc || echo 'export CMUX_SOCKET_PATH=$REMOTE_SOCK' >> ~/.zshrc
+    tmux set-environment -g CMUX_WORKSPACE_ID '$ws_id' 2>/dev/null
+    tmux set-environment -g CMUX_TAB_ID '$tab_id' 2>/dev/null
+    tmux set-environment -g CMUX_PANEL_ID '$panel_id' 2>/dev/null
+    tmux set-environment -g CMUX_SURFACE_ID '$surface_id' 2>/dev/null
+    # Update .zshrc — replace existing cmux export or add new
+    sed -i '/^export CMUX_SOCKET_PATH=/d' ~/.zshrc 2>/dev/null
+    echo '$EXPORT_LINE' >> ~/.zshrc
 " 2>/dev/null
 
-# Start persistent tunnel — auto-reconnects, no port forwards from ssh_config
+# Start persistent tunnel — auto-reconnects
 (
     while true; do
         ssh -o ServerAliveInterval=15 \

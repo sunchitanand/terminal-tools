@@ -36,15 +36,5 @@
         }
       ]
     }
-  ],
-  "UserPromptSubmit": [
-    {
-      "hooks": [
-        {
-          "type": "command",
-          "command": "bash ~/.claude/cmux-title.sh"
-        }
-      ]
-    }
   ]
 }

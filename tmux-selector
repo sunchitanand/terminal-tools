@@ -50,8 +50,13 @@ run_remote() {
                 local tab="${CMUX_TAB_ID:-}"
                 local panel="${CMUX_PANEL_ID:-}"
                 local surface="${CMUX_SURFACE_ID:-}"
-                local se="$RTMUX set-environment -t '=$sess'"
-                cmd="$se CMUX_SOCKET_PATH '$rs' 2>/dev/null; $se CMUX_WORKSPACE_ID '$ws' 2>/dev/null; $se CMUX_TAB_ID '$tab' 2>/dev/null; $se CMUX_PANEL_ID '$panel' 2>/dev/null; $se CMUX_SURFACE_ID '$surface' 2>/dev/null; $cmd"
+                # Set env directly on the session using tmux commands chained before attach
+                local env_cmd="$RTMUX set-environment -t '\"$sess\"' CMUX_SOCKET_PATH '$rs' 2>/dev/null;"
+                env_cmd+="$RTMUX set-environment -t '\"$sess\"' CMUX_WORKSPACE_ID '$ws' 2>/dev/null;"
+                env_cmd+="$RTMUX set-environment -t '\"$sess\"' CMUX_TAB_ID '$tab' 2>/dev/null;"
+                env_cmd+="$RTMUX set-environment -t '\"$sess\"' CMUX_PANEL_ID '$panel' 2>/dev/null;"
+                env_cmd+="$RTMUX set-environment -t '\"$sess\"' CMUX_SURFACE_ID '$surface' 2>/dev/null;"
+                cmd="$env_cmd $cmd"
             fi
         fi
         exec ssh $SSH_OPTS $CMUX_SSH_EXTRA -t "$HOST" "${CMUX_PREFIX} ${CMUX_TMUX_ENV} $cmd"

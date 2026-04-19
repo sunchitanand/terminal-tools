@@ -28,9 +28,19 @@ fi
 CMUX_TMUX_ENV=""
 if [[ -n "$CMUX_PREFIX" ]]; then
     local rs="/tmp/cmux.sock"
-    # We use SESSION_PLACEHOLDER which gets replaced with the actual session name in run_remote
     CMUX_TMUX_ENV="$RTMUX set-environment -g CMUX_SOCKET_PATH '$rs' 2>/dev/null;"
     CMUX_TMUX_ENV+="$RTMUX set-option -g update-environment 'CMUX_SOCKET_PATH CMUX_WORKSPACE_ID CMUX_TAB_ID CMUX_PANEL_ID CMUX_SURFACE_ID' 2>/dev/null;"
+    # Deploy helper script for setting per-session CMUX env vars (avoids quoting issues with / in session names)
+    ssh $SSH_OPTS $HOST "mkdir -p ~/.cmux-kiro && cat > ~/.cmux-kiro/set-env.sh << 'CMUXEOF'
+#!/bin/bash
+sess=\"\$1\"; shift
+export PATH=\"/usr/local/bin:/apollo/env/envImprovement/bin:\$PATH\"
+while [[ \$# -ge 2 ]]; do
+    tmux set-environment -t \"\$sess\" \"\$1\" \"\$2\"
+    shift 2
+done
+CMUXEOF
+chmod +x ~/.cmux-kiro/set-env.sh" 2>/dev/null
 fi
 
 # Run a remote command
@@ -40,22 +50,16 @@ run_remote() {
     else
         local cmd="$1"
         # For tmux commands, set per-session CMUX env vars
-        if [[ -n "$CMUX_PREFIX" && "$cmd" == *"tmux"* ]]; then
+        if [[ -n "$CMUX_PREFIX" && "$cmd" == *"attach -t"* ]]; then
             local sess=""
-            [[ "$cmd" == *"attach -t"* ]] && sess=$(echo "$cmd" | sed 's/.*attach -t "\{0,1\}\([^"]*\)"\{0,1\}.*/\1/')
-            [[ "$cmd" == *"new -s"* ]] && sess=$(echo "$cmd" | sed 's/.*new -s "\{0,1\}\([^"]*\)"\{0,1\}.*/\1/')
+            sess=$(echo "$cmd" | sed 's/.*attach -t "\{0,1\}\([^"]*\)"\{0,1\}.*/\1/')
             if [[ -n "$sess" ]]; then
                 local rs="/tmp/cmux.sock"
                 local ws="${CMUX_WORKSPACE_ID:-}"
                 local tab="${CMUX_TAB_ID:-}"
                 local panel="${CMUX_PANEL_ID:-}"
                 local surface="${CMUX_SURFACE_ID:-}"
-                # Set env directly on the session using tmux commands chained before attach
-                local env_cmd="$RTMUX set-environment -t $sess CMUX_SOCKET_PATH $rs 2>/dev/null;"
-                env_cmd+="$RTMUX set-environment -t $sess CMUX_WORKSPACE_ID $ws 2>/dev/null;"
-                env_cmd+="$RTMUX set-environment -t $sess CMUX_TAB_ID $tab 2>/dev/null;"
-                env_cmd+="$RTMUX set-environment -t $sess CMUX_PANEL_ID $panel 2>/dev/null;"
-                env_cmd+="$RTMUX set-environment -t $sess CMUX_SURFACE_ID $surface 2>/dev/null;"
+                local env_cmd="~/.cmux-kiro/set-env.sh '${sess}' CMUX_SOCKET_PATH '${rs}' CMUX_WORKSPACE_ID '${ws}' CMUX_TAB_ID '${tab}' CMUX_PANEL_ID '${panel}' CMUX_SURFACE_ID '${surface}';"
                 cmd="$env_cmd $cmd"
             fi
         fi
@@ -499,6 +503,7 @@ while true; do
                     printf '\n  %sSession name (project/name):%s ' "$C" "$R"
                     read -r new_name
                     if [[ -n "$new_name" ]]; then
+                        printf '%s\t\n' "$new_name" | write_config
                         cleanup; run_remote "$RTMUX new -s \"$new_name\""
                     fi
                     stty -echo raw; printf '\e[?25l'
@@ -533,6 +538,7 @@ while true; do
                     printf '\n  %sSession name (project/name):%s ' "$C" "$R"
                     read -r new_name
                     if [[ -n "$new_name" ]]; then
+                        printf '%s\t\n' "$new_name" | write_config
                         cleanup; run_remote "$RTMUX new -s \"$new_name\""
                     fi
                     stty -echo raw; printf '\e[?25l'

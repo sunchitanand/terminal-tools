@@ -12,7 +12,7 @@
       "hooks": [
         {
           "type": "command",
-          "command": "cmux set-status agent 'Claude ready' --icon brain --color '#F97316' 2>/dev/null; true"
+          "command": "cmux set-status claude 'Claude ready' --icon brain --color '#F97316' 2>/dev/null; true"
         }
       ]
     }
@@ -22,7 +22,7 @@
       "hooks": [
         {
           "type": "command",
-          "command": "cmux set-status agent 'Done' --icon checkmark.circle --color '#22C55E' 2>/dev/null; cmux notify --title 'Claude Code' --body 'Task complete' 2>/dev/null; true"
+          "command": "cmux set-status claude 'Done' --icon checkmark.circle --color '#22C55E' 2>/dev/null; cmux notify --title 'Claude Code' --body 'Task complete' 2>/dev/null; true"
         }
       ]
     }
@@ -32,7 +32,17 @@
       "hooks": [
         {
           "type": "command",
-          "command": "cmux notify --title 'Claude Code' --body 'Needs attention' 2>/dev/null; cmux set-status agent 'Waiting' --icon questionmark.circle --color '#A855F7' 2>/dev/null; true"
+          "command": "cmux notify --title 'Claude Code' --body 'Needs attention' 2>/dev/null; cmux set-status claude 'Waiting' --icon questionmark.circle --color '#A855F7' 2>/dev/null; true"
+        }
+      ]
+    }
+  ],
+  "UserPromptSubmit": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "cmux clear-notifications 2>/dev/null; cmux set-status claude 'Working' --icon brain --color '#F97316' 2>/dev/null; true"
         }
       ]
     }

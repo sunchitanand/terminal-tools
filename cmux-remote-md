@@ -1,0 +1,41 @@
+#!/usr/bin/env zsh
+# cmux-remote-md — open a remote markdown file in cmux's markdown viewer
+# Usage: cmux-remote-md <host> <remote-path>
+#        Or from inside a tmux session: cmux-remote-md <remote-path>
+
+if [[ $# -eq 1 ]]; then
+    # Assume we're in a remote session, detect host from SSH_CONNECTION
+    REMOTE_PATH="$1"
+    HOST="${CMUX_REMOTE_HOST:-}"
+    if [[ -z "$HOST" ]]; then
+        echo "Usage: cmux-remote-md <host> <remote-path>" >&2
+        echo "  Or set CMUX_REMOTE_HOST" >&2
+        exit 1
+    fi
+elif [[ $# -eq 2 ]]; then
+    HOST="$1"
+    REMOTE_PATH="$2"
+else
+    echo "Usage: cmux-remote-md [host] <remote-path>" >&2
+    exit 1
+fi
+
+LOCAL_DIR="/tmp/cmux-md"
+mkdir -p "$LOCAL_DIR"
+
+FILENAME=$(basename "$REMOTE_PATH")
+LOCAL_PATH="$LOCAL_DIR/${HOST%%.*}-${FILENAME}"
+
+# Copy file
+scp -o LogLevel=ERROR "$HOST:$REMOTE_PATH" "$LOCAL_PATH" 2>/dev/null || { echo "Failed to copy $REMOTE_PATH from $HOST"; exit 1; }
+
+# Open in cmux
+cmux markdown open "$LOCAL_PATH"
+
+# Watch for changes and re-sync (background)
+(
+    while true; do
+        sleep 2
+        scp -o LogLevel=ERROR "$HOST:$REMOTE_PATH" "$LOCAL_PATH" 2>/dev/null
+    done
+) &!

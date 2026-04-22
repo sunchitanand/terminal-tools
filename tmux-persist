@@ -1,0 +1,34 @@
+#!/usr/bin/env zsh
+# tmux-persist — auto-reconnecting wrapper for remote tmux sessions
+# Usage: tmux-persist <host> <session-name>
+# Reconnects automatically when SSH drops (laptop sleep, network change, etc.)
+
+HOST="$1"
+SESSION="$2"
+RTMUX='PATH=/usr/local/bin:/apollo/env/envImprovement/bin:$PATH tmux -u'
+SSH_OPTS=(-o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o LogLevel=ERROR)
+
+[[ -z "$HOST" || -z "$SESSION" ]] && { echo "Usage: tmux-persist <host> <session>"; exit 1; }
+
+# cmux socket forwarding
+CMUX_EXTRA=()
+CMUX_ENV=""
+if [[ -S "${CMUX_SOCKET_PATH:-$HOME/Library/Application Support/cmux/cmux.sock}" ]]; then
+    local sock="${CMUX_SOCKET_PATH:-$HOME/Library/Application Support/cmux/cmux.sock}"
+    CMUX_EXTRA=(-o StreamLocalBindUnlink=yes -o ControlPath=none -R "/tmp/cmux.sock:$sock")
+    CMUX_ENV="export CMUX_SOCKET_PATH=/tmp/cmux.sock"
+    CMUX_ENV+=" CMUX_WORKSPACE_ID=${CMUX_WORKSPACE_ID:-}"
+    CMUX_ENV+=" CMUX_TAB_ID=${CMUX_TAB_ID:-}"
+    CMUX_ENV+=" CMUX_PANEL_ID=${CMUX_PANEL_ID:-}"
+    CMUX_ENV+=" CMUX_SURFACE_ID=${CMUX_SURFACE_ID:-};"
+fi
+
+while true; do
+    echo "Connecting to $HOST → $SESSION..."
+    ssh $SSH_OPTS $CMUX_EXTRA -t "$HOST" "$CMUX_ENV $RTMUX attach -t \"$SESSION\" 2>/dev/null || $RTMUX new -s \"$SESSION\""
+    EXIT=$?
+    # Exit code 0 = clean detach (user pressed Ctrl+B d) — don't reconnect
+    [[ $EXIT -eq 0 ]] && break
+    echo "Connection lost. Reconnecting in 3s... (Ctrl+C to stop)"
+    sleep 3
+done

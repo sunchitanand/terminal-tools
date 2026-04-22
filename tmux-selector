@@ -197,6 +197,8 @@ typeset -a selectable
 search=""
 search_mode=0
 viewport_top=1
+action_idx=0
+typeset -a ACTIONS=("attach" "rename" "delete")
 
 build_display() {
     dsp_text=(); dsp_type=(); dsp_idx=(); selectable=()
@@ -436,11 +438,26 @@ draw() {
     ((line++))
 
     printf '\r\n'
+    # Action bar: highlight the current action with icon
+    local a0="  attach  " a1="  rename  " a2="  delete  "
+    local g0="${D}${a0}${R}" g1="${D}${a1}${R}" g2="${D}${a2}${R}"
+    case $action_idx in
+        0) g0="${SEL}${a0}${R}" ;;
+        1) g1="${SEL}${a1}${R}" ;;
+        2) g2="${SEL}${a2}${R}" ;;
+    esac
+    local actions_bar="${g0}${D}│${R}${g1}${D}│${R}${g2}"
+
     if [[ $search_mode -eq 1 ]]; then
-        printf '  %s🔍%s %s%s%s█  %sesc%s clear\r\n' "$Y" "$R" "$C" "$search" "$R" "$D" "$R"
+        printf '  %s%s%s %s%s%s█    %s%s   %s↵%s run   %sesc%s clear\r\n' \
+            "$Y" "" "$R" "$C" "$search" "$R" \
+            "$actions_bar" \
+            "$D" "$R" "$D" "$R"
     else
-        local keys='%s↑↓%s select  %s⏎%s attach  %s␣%s rename  %sd%s delete  %sq%s quit\r\n'
-        printf "  $keys" "$D" "$R" "$D" "$R" "$D" "$R" "$D" "$R" "$D" "$R"
+        printf '  %s↑↓%s nav    %s%s   %s↵%s run   %s/%s search   %sq%s quit\r\n' \
+            "$D" "$R" \
+            "$actions_bar" \
+            "$D" "$R" "$D" "$R" "$D" "$R"
     fi
 }
 
@@ -463,6 +480,74 @@ is_current_running() {
 
 is_on_new() {
     [[ "${dsp_type[${selectable[sel]}]}" == "new" ]]
+}
+
+# Actions (callable from both normal and search mode)
+do_attach() {
+    if is_on_new; then
+        stty sane; printf '\e[?25h'
+        printf '\n  %sSession name (project/name):%s ' "$C" "$R"
+        read -r new_name
+        if [[ -n "$new_name" ]]; then
+            printf '%s\t\n' "$new_name" | write_config
+            cleanup; run_remote "$RTMUX new -s \"$new_name\""
+        fi
+        stty -echo raw; printf '\e[?25l'
+    elif is_current_running; then
+        cleanup; run_remote "$RTMUX attach -t \"$(current_session_name)\""
+    else
+        local dir="$(current_session_dir)"
+        local name="$(current_session_name)"
+        local cd_cmd=""
+        [[ -n "$dir" ]] && cd_cmd="cd $dir &&"
+        cleanup; run_remote "$RTMUX new -s \"$name\" '$cd_cmd exec \$SHELL'"
+    fi
+}
+
+do_rename() {
+    is_on_new && return
+    local old_name="$(current_session_name)"
+    stty sane; printf '\e[?25h'
+    printf '\n  %sNew name for %s%s%s:%s ' "$C" "$M" "$old_name" "$C" "$R"
+    read -r new_name
+    if [[ -n "$new_name" ]]; then
+        local old_dir="$(current_session_dir)"
+        if is_current_running; then
+            ssh $SSH_OPTS $HOST "$RTMUX rename-session -t \"$old_name\" \"$new_name\"" 2>/dev/null
+        fi
+        remove_from_config "$old_name"
+        printf '%s\t%s\n' "$new_name" "$old_dir" | write_config
+        fetch_sessions; build_display
+        search=""; search_mode=0; sel=1; viewport_top=1; action_idx=0
+    fi
+    stty -echo raw; printf '\e[?25l'
+}
+
+do_delete() {
+    is_on_new && return
+    local name="$(current_session_name)"
+    stty sane; printf '\e[?25h'
+    printf '\n  %sDelete %s%s%s? (y/n):%s ' "$C" "$M" "$name" "$C" "$R"
+    read -rsk1 confirm
+    if [[ "$confirm" == "y" ]]; then
+        if is_current_running; then
+            ssh $SSH_OPTS $HOST "$RTMUX kill-session -t \"$name\"" 2>/dev/null
+        fi
+        remove_from_config "$name"
+        fetch_sessions; build_display
+        search=""; search_mode=0; action_idx=0
+        [[ $sel -gt $#selectable ]] && sel=$#selectable
+        [[ $sel -lt 1 ]] && sel=1
+    fi
+    stty -echo raw; printf '\e[?25l'
+}
+
+do_current_action() {
+    case $action_idx in
+        0) do_attach ;;
+        1) do_rename ;;
+        2) do_delete ;;
+    esac
 }
 
 cleanup() { printf '\e[?25h'; stty sane 2>/dev/null; }
@@ -496,26 +581,18 @@ while true; do
         case "$key" in
             $'\e[A'|$'\eOA') nav_up ;;
             $'\e[B'|$'\eOB') nav_down ;;
+            $'\e[C'|$'\eOC')
+                if [[ $action_idx -lt 2 ]]; then ((action_idx++)); fi ;;
+            $'\e[D'|$'\eOD')
+                if [[ $action_idx -gt 0 ]]; then
+                    ((action_idx--))
+                else
+                    search=""; search_mode=0; sel=1; viewport_top=1
+                fi ;;
             $'\n'|$'\r'|'')
                 search_mode=0
-                if is_on_new; then
-                    stty sane; printf '\e[?25h'
-                    printf '\n  %sSession name (project/name):%s ' "$C" "$R"
-                    read -r new_name
-                    if [[ -n "$new_name" ]]; then
-                        printf '%s\t\n' "$new_name" | write_config
-                        cleanup; run_remote "$RTMUX new -s \"$new_name\""
-                    fi
-                    stty -echo raw; printf '\e[?25l'
-                elif is_current_running; then
-                    cleanup; run_remote "$RTMUX attach -t \"$(current_session_name)\""
-                else
-                    local dir="$(current_session_dir)"
-                    local name="$(current_session_name)"
-                    local cd_cmd=""
-                    [[ -n "$dir" ]] && cd_cmd="cd $dir &&"
-                    cleanup; run_remote "$RTMUX new -s \"$name\" '$cd_cmd exec \$SHELL'"
-                fi ;;
+                do_current_action
+                action_idx=0 ;;
             $'\x7f'|$'\b')
                 if [[ -n "$search" ]]; then
                     search="${search[1,-2]}"
@@ -532,61 +609,17 @@ while true; do
         case "$key" in
             $'\e[A'|$'\eOA') nav_up ;;
             $'\e[B'|$'\eOB') nav_down ;;
+            $'\e[C'|$'\eOC')
+                if [[ $action_idx -lt 2 ]]; then ((action_idx++)); fi ;;
+            $'\e[D'|$'\eOD')
+                if [[ $action_idx -gt 0 ]]; then ((action_idx--)); fi ;;
             $'\n'|$'\r'|'')
-                if is_on_new; then
-                    stty sane; printf '\e[?25h'
-                    printf '\n  %sSession name (project/name):%s ' "$C" "$R"
-                    read -r new_name
-                    if [[ -n "$new_name" ]]; then
-                        printf '%s\t\n' "$new_name" | write_config
-                        cleanup; run_remote "$RTMUX new -s \"$new_name\""
-                    fi
-                    stty -echo raw; printf '\e[?25l'
-                elif is_current_running; then
-                    cleanup; run_remote "$RTMUX attach -t \"$(current_session_name)\""
-                else
-                    local dir="$(current_session_dir)"
-                    local name="$(current_session_name)"
-                    local cd_cmd=""
-                    [[ -n "$dir" ]] && cd_cmd="cd $dir &&"
-                    cleanup; run_remote "$RTMUX new -s \"$name\" '$cd_cmd exec \$SHELL'"
-                fi ;;
+                do_current_action
+                action_idx=0 ;;
             ' ')
-                if ! is_on_new; then
-                    local old_name="$(current_session_name)"
-                    stty sane; printf '\e[?25h'
-                    printf '\n  %sNew name for %s%s%s:%s ' "$C" "$M" "$old_name" "$C" "$R"
-                    read -r new_name
-                    if [[ -n "$new_name" ]]; then
-                        local old_dir="$(current_session_dir)"
-                        if is_current_running; then
-                            ssh $SSH_OPTS $HOST "$RTMUX rename-session -t \"$old_name\" \"$new_name\"" 2>/dev/null
-                        fi
-                        remove_from_config "$old_name"
-                        printf '%s\t%s\n' "$new_name" "$old_dir" | write_config
-                        fetch_sessions; build_display
-                        search=""; sel=1; viewport_top=1
-                    fi
-                    stty -echo raw; printf '\e[?25l'
-                fi ;;
+                do_rename ;;
             'd')
-                if ! is_on_new; then
-                    local name="$(current_session_name)"
-                    stty sane; printf '\e[?25h'
-                    printf '\n  %sDelete %s%s%s? (y/n):%s ' "$C" "$M" "$name" "$C" "$R"
-                    read -rsk1 confirm
-                    if [[ "$confirm" == "y" ]]; then
-                        if is_current_running; then
-                            ssh $SSH_OPTS $HOST "$RTMUX kill-session -t \"$name\"" 2>/dev/null
-                        fi
-                        remove_from_config "$name"
-                        fetch_sessions; build_display
-                        search=""
-                        [[ $sel -gt $#selectable ]] && sel=$#selectable
-                        [[ $sel -lt 1 ]] && sel=1
-                    fi
-                    stty -echo raw; printf '\e[?25l'
-                fi ;;
+                do_delete ;;
             '/')
                 search_mode=1; search="" ;;
             'q')

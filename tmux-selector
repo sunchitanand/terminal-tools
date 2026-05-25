@@ -1,6 +1,6 @@
 #!/usr/bin/env zsh
 HOST="${1:-sunchit-cd2.aka.corp.amazon.com}"
-SSH_OPTS=(-o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o LogLevel=ERROR)
+SSH_OPTS=(-o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o LogLevel=ERROR)
 RTMUX='PATH=/usr/local/bin:/apollo/env/envImprovement/bin:$PATH tmux -u'
 CONFIG="$HOME/.tmux-projects.json"
 
@@ -43,13 +43,13 @@ CMUXEOF
 chmod +x ~/.cmux-kiro/set-env.sh" 2>/dev/null
 fi
 
-# Run a remote command
+# Run a remote command (with auto-reconnect for tmux attach/new)
 run_remote() {
     if [[ $USE_MOSH -eq 1 ]]; then
         exec mosh "$HOST" -- bash -lc "$1"
     else
         local cmd="$1"
-        # For tmux commands, set per-session CMUX env vars
+        # For tmux attach, set per-session CMUX env vars
         if [[ -n "$CMUX_PREFIX" && "$cmd" == *"attach -t"* ]]; then
             local sess=""
             sess=$(echo "$cmd" | sed 's/.*attach -t "\{0,1\}\([^"]*\)"\{0,1\}.*/\1/')
@@ -63,7 +63,34 @@ run_remote() {
                 cmd="$env_cmd $cmd"
             fi
         fi
-        exec ssh $SSH_OPTS $CMUX_SSH_EXTRA -t "$HOST" "${CMUX_PREFIX} ${CMUX_TMUX_ENV} $cmd"
+        local full_cmd="${CMUX_PREFIX} ${CMUX_TMUX_ENV} $cmd"
+        # Auto-reconnect loop for tmux sessions
+        if [[ "$cmd" == *"attach -t"* || "$cmd" == *"new -s"* ]]; then
+            # Extract session name for reconnect (switch new→attach on retry)
+            local reconnect_sess=""
+            if [[ "$cmd" == *"new -s"* ]]; then
+                reconnect_sess=$(echo "$cmd" | sed 's/.*new -s "\{0,1\}\([^"]*\)"\{0,1\}.*/\1/')
+            elif [[ "$cmd" == *"attach -t"* ]]; then
+                reconnect_sess=$(echo "$cmd" | sed 's/.*attach -t "\{0,1\}\([^"]*\)"\{0,1\}.*/\1/')
+            fi
+            local reconnect_cmd="${CMUX_PREFIX} ${CMUX_TMUX_ENV} $RTMUX attach -t \"$reconnect_sess\""
+            trap 'exit 130' INT
+            # First run uses original command (new or attach)
+            ssh $SSH_OPTS $CMUX_SSH_EXTRA -t "$HOST" "$full_cmd"
+            local rc=$?
+            [[ $rc -eq 0 ]] && exit 0
+            # Subsequent retries always use attach
+            while true; do
+                printf '\r\n  %s⚡ Connection lost. Reconnecting in 3s...%s (Ctrl+C to stop)\r\n' "$Y" "$R"
+                sleep 3 &
+                wait $! 2>/dev/null || exit 130
+                ssh $SSH_OPTS $CMUX_SSH_EXTRA -t "$HOST" "$reconnect_cmd"
+                rc=$?
+                [[ $rc -eq 0 ]] && exit 0
+            done
+        else
+            exec ssh $SSH_OPTS $CMUX_SSH_EXTRA -t "$HOST" "$full_cmd"
+        fi
     fi
 }
 

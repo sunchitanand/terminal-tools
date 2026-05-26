@@ -222,10 +222,8 @@ fetch_sessions() {
 typeset -a dsp_text dsp_type dsp_idx
 typeset -a selectable
 search=""
-search_mode=0
 viewport_top=1
 action_idx=0
-typeset -a ACTIONS=("attach" "rename" "delete")
 
 build_display() {
     dsp_text=(); dsp_type=(); dsp_idx=(); selectable=()
@@ -465,7 +463,7 @@ draw() {
     ((line++))
 
     printf '\r\n'
-    # Action bar: highlight the current action with icon
+    # Action bar: highlight the current action
     local a0="  attach  " a1="  rename  " a2="  delete  "
     local g0="${D}${a0}${R}" g1="${D}${a1}${R}" g2="${D}${a2}${R}"
     case $action_idx in
@@ -475,13 +473,13 @@ draw() {
     esac
     local actions_bar="${g0}${D}│${R}${g1}${D}│${R}${g2}"
 
-    if [[ $search_mode -eq 1 ]]; then
-        printf '  %s%s%s %s%s%s█    %s%s   %s↵%s run   %sesc%s clear\r\n' \
-            "$Y" "" "$R" "$C" "$search" "$R" \
+    if [[ -n "$search" ]]; then
+        printf '  %s%s%s█    %s   %s↵%s run  %s⇥%s action  %sesc%s clear\r\n' \
+            "$C" "$search" "$R" \
             "$actions_bar" \
-            "$D" "$R" "$D" "$R"
+            "$D" "$R" "$D" "$R" "$D" "$R"
     else
-        printf '  %s↑↓%s nav    %s%s   %s↵%s run   %s/%s search   %sq%s quit\r\n' \
+        printf '  %s↑↓%s nav   %s   %s↵%s run  %s⇥%s action  %sq%s quit\r\n' \
             "$D" "$R" \
             "$actions_bar" \
             "$D" "$R" "$D" "$R" "$D" "$R"
@@ -545,7 +543,7 @@ do_rename() {
         remove_from_config "$old_name"
         printf '%s\t%s\n' "$new_name" "$old_dir" | write_config
         fetch_sessions; build_display
-        search=""; search_mode=0; sel=1; viewport_top=1; action_idx=0
+        search=""; sel=1; viewport_top=1; action_idx=0
     fi
     stty -echo raw; printf '\e[?25l'
 }
@@ -562,7 +560,7 @@ do_delete() {
         fi
         remove_from_config "$name"
         fetch_sessions; build_display
-        search=""; search_mode=0; action_idx=0
+        search=""; action_idx=0
         [[ $sel -gt $#selectable ]] && sel=$#selectable
         [[ $sel -lt 1 ]] && sel=1
     fi
@@ -595,71 +593,45 @@ while true; do
     if [[ "$key" == $'\e' ]]; then
         read -rsk1 -t 0.05 k2
         if [[ -z "$k2" ]]; then
-            if [[ $search_mode -eq 1 ]]; then
-                search=""; search_mode=0; sel=1; viewport_top=1
-                draw; continue
-            fi
+            # Esc: clear search and reset action
+            search=""; sel=1; viewport_top=1; action_idx=0
+            draw; continue
         else
             read -rsk1 -t 0.05 k3; key="${key}${k2}${k3}"
         fi
     fi
 
-    if [[ $search_mode -eq 1 ]]; then
-        case "$key" in
-            $'\e[A'|$'\eOA') nav_up ;;
-            $'\e[B'|$'\eOB') nav_down ;;
-            $'\e[C'|$'\eOC')
-                if [[ $action_idx -lt 2 ]]; then ((action_idx++)); fi ;;
-            $'\e[D'|$'\eOD')
-                if [[ $action_idx -gt 0 ]]; then
-                    ((action_idx--))
-                else
-                    search=""; search_mode=0; sel=1; viewport_top=1
-                fi ;;
-            $'\n'|$'\r'|'')
-                search_mode=0
-                do_current_action
-                action_idx=0 ;;
-            $'\x7f'|$'\b')
-                if [[ -n "$search" ]]; then
-                    search="${search[1,-2]}"
-                    if [[ -n "$search" ]]; then jump_to_first_match; else search_mode=0; sel=1; fi
-                    viewport_top=1
-                else
-                    search_mode=0; sel=1; viewport_top=1
-                fi ;;
-            [[:print:]])
+    case "$key" in
+        $'\e[A'|$'\eOA') nav_up ;;
+        $'\e[B'|$'\eOB') nav_down ;;
+        $'\t')
+            # Tab: cycle action forward
+            action_idx=$(( (action_idx + 1) % 3 )) ;;
+        $'\e[Z')
+            # Shift+Tab: cycle action backward
+            action_idx=$(( (action_idx + 2) % 3 )) ;;
+        $'\n'|$'\r'|'')
+            do_current_action
+            action_idx=0 ;;
+        $'\x7f'|$'\b')
+            # Backspace: delete last search char
+            if [[ -n "$search" ]]; then
+                search="${search[1,-2]}"
+                if [[ -n "$search" ]]; then jump_to_first_match; else sel=1; fi
+                viewport_top=1
+            fi ;;
+        'q')
+            if [[ -n "$search" ]]; then
                 search+="$key"
-                jump_to_first_match ;;
-        esac
-    else
-        case "$key" in
-            $'\e[A'|$'\eOA') nav_up ;;
-            $'\e[B'|$'\eOB') nav_down ;;
-            $'\e[C'|$'\eOC')
-                if [[ $action_idx -lt 2 ]]; then ((action_idx++)); fi ;;
-            $'\e[D'|$'\eOD')
-                if [[ $action_idx -gt 0 ]]; then ((action_idx--)); fi ;;
-            $'\n'|$'\r'|'')
-                do_current_action
-                action_idx=0 ;;
-            ' ')
-                do_rename ;;
-            'd')
-                do_delete ;;
-            '/')
-                search_mode=1; search="" ;;
-            'q')
-                if [[ -n "$search" ]]; then
-                    search=""; search_mode=0; sel=1; viewport_top=1
-                else
-                    cleanup; exit 0
-                fi ;;
-            [[:print:]])
-                search_mode=1; search="$key"
-                jump_to_first_match ;;
-            *) ;;
-        esac
-    fi
+                jump_to_first_match
+            else
+                cleanup; exit 0
+            fi ;;
+        [[:print:]])
+            # Any printable char: add to search
+            search+="$key"
+            jump_to_first_match ;;
+        *) ;;
+    esac
     draw
 done

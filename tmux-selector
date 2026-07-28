@@ -96,6 +96,7 @@ run_remote() {
 
 C=$'\e[36m' M=$'\e[35m' G=$'\e[32m' Y=$'\e[33m' D=$'\e[90m' R=$'\e[0m' B=$'\e[1m'
 SEL=$'\e[44;97m' ON=$'\e[32m●\e[0m' OFF=$'\e[90m○\e[0m' HI=$'\e[43;30m'
+PICK=$'\e[48;5;236m'  # subtle dark-gray background for bulk-selected rows
 
 # --- Config helpers (JSON via python3, stored locally) ---
 
@@ -224,6 +225,7 @@ typeset -a selectable
 search=""
 viewport_top=1
 action_idx=0
+typeset -A selected  # bulk-selection set, keyed by session name (stable across refetch)
 
 build_display() {
     dsp_text=(); dsp_type=(); dsp_idx=(); selectable=()
@@ -439,19 +441,33 @@ draw() {
                 local dc="$D" nc="$D"
                 [[ ${sess_running[si]} -eq 1 ]] && dc="$G" && nc="$C"
                 local created="${sess_created[si]}" activity="${sess_activity[si]}"
+                # Selection marker: ✓ when this session is in the bulk-select set
+                local is_picked="" mark=" " mc="$D"
+                [[ -n "${selected[${sess_names[si]}]}" ]] && is_picked=1 && mark="✓" && mc="$Y"
                 if [[ $i -eq $sel_dsp ]]; then
+                    # Highlighted (cursor) row — full selection bar wins over pick tint
                     printf "\r\e[${C2}G%s│%s %-30s\e[${C3}G%s│%s %-13s\e[${C4}G%s│%s %-13s\e[${C5}G%s│%s\r" \
                         "$D" "$SEL" "${dsp_text[i]}" \
                         "$D" "$SEL" "$created" \
                         "$D" "$SEL" "$activity" "$D" "$R"
-                    printf "\r  %s│%s %s %s\e[${C2}G" "$D" "$SEL" "$dot" "$R"
+                    # dot cell (cols 4-8): space, mark, 2-space gap, dot
+                    printf "\r  %s│%s %s  %s%s\e[${C2}G" "$D" "$SEL" "$mark" "$dot" "$R"
+                    printf "\r\n"
+                elif [[ -n "$is_picked" ]]; then
+                    # Selected (not cursor) row — subtle background tint across the row
+                    printf "\r\e[${C2}G%s│%s%s %-30s\e[${C3}G%s│%s%s %-13s\e[${C4}G%s│%s%s %-13s\e[${C5}G%s│%s\r" \
+                        "$D" "$PICK" "$nc" "${dsp_text[i]}" \
+                        "$D" "$PICK" "$Y" "$created" \
+                        "$D" "$PICK" "$Y" "$activity" "$D" "$R"
+                    printf "\r  %s│%s%s%s  %s%s%s\e[${C2}G" "$D" "$PICK" "$mc" "$mark" "$dc" "$dot" "$R"
                     printf "\r\n"
                 else
+                    # dot cell (cols 4-8): space, mark, 2-space gap, dot
                     printf "\r\e[${C2}G%s│%s %-30s\e[${C3}G%s│%s %-13s\e[${C4}G%s│%s %-13s\e[${C5}G%s│%s\r" \
                         "$D" "$nc" "${dsp_text[i]}" \
                         "$D" "$Y" "$created" \
                         "$D" "$Y" "$activity" "$D" "$R"
-                    printf "\r  %s│ %s%s%s \e[${C2}G" "$D" "$dc" "$dot" "$R"
+                    printf "\r  %s│ %s%s  %s%s%s\e[${C2}G" "$D" "$mc" "$mark" "$dc" "$dot" "$R"
                     printf "\r\n"
                 fi
                 ((line++))
@@ -463,8 +479,11 @@ draw() {
     ((line++))
 
     printf '\r\n'
-    # Action bar: highlight the current action
+    # Action bar: highlight the current action. When sessions are selected,
+    # 'delete' becomes a bulk action labelled with the count.
+    local nsel=${#selected}
     local a0="  attach  " a1="  rename  " a2="  delete  "
+    [[ $nsel -gt 0 ]] && a2="  delete $nsel  "
     local g0="${D}${a0}${R}" g1="${D}${a1}${R}" g2="${D}${a2}${R}"
     case $action_idx in
         0) g0="${SEL}${a0}${R}" ;;
@@ -473,16 +492,20 @@ draw() {
     esac
     local actions_bar="${g0}${D}│${R}${g1}${D}│${R}${g2}"
 
+    # Selection counter chip
+    local sel_chip=""
+    [[ $nsel -gt 0 ]] && sel_chip="  ${Y}✓ $nsel selected${R}"
+
     if [[ -n "$search" ]]; then
-        printf '  %s%s%s█    %s   %s↵%s run  %s⇥%s action  %sesc%s clear\r\n' \
+        printf '  %s%s%s█    %s%s   %s↵%s run  %s⇥%s action  %s␣%s pick  %sesc%s clear\r\n' \
             "$C" "$search" "$R" \
-            "$actions_bar" \
-            "$D" "$R" "$D" "$R" "$D" "$R"
+            "$actions_bar" "$sel_chip" \
+            "$D" "$R" "$D" "$R" "$D" "$R" "$D" "$R"
     else
-        printf '  %s↑↓%s nav   %s   %s↵%s run  %s⇥%s action  %sq%s quit\r\n' \
+        printf '  %s↑↓%s nav   %s%s   %s↵%s run  %s⇥%s action  %s␣%s pick  %sq%s quit\r\n' \
             "$D" "$R" \
-            "$actions_bar" \
-            "$D" "$R" "$D" "$R" "$D" "$R"
+            "$actions_bar" "$sel_chip" \
+            "$D" "$R" "$D" "$R" "$D" "$R" "$D" "$R"
     fi
 }
 
@@ -549,6 +572,11 @@ do_rename() {
 }
 
 do_delete() {
+    # Bulk delete when sessions are selected (works regardless of cursor position)
+    if [[ ${#selected} -gt 0 ]]; then
+        do_bulk_delete
+        return
+    fi
     is_on_new && return
     local name="$(current_session_name)"
     stty sane; printf '\e[?25h'
@@ -565,6 +593,44 @@ do_delete() {
         [[ $sel -lt 1 ]] && sel=1
     fi
     stty -echo raw; printf '\e[?25l'
+}
+
+do_bulk_delete() {
+    # Selected session names are the keys themselves
+    typeset -a names
+    names=(${(k)selected})
+    local n=${#names}
+    stty sane; printf '\e[?25h'
+    printf '\n  %sDelete %s%d%s selected session(s)? (y/n):%s ' "$C" "$M" "$n" "$C" "$R"
+    read -rsk1 confirm
+    if [[ "$confirm" == "y" ]]; then
+        # Batch all kill-session commands into a single SSH call
+        local kill_cmds=""
+        for name in $names; do
+            kill_cmds+="$RTMUX kill-session -t \"$name\" 2>/dev/null;"
+        done
+        ssh $SSH_OPTS $HOST "$kill_cmds" 2>/dev/null
+        for name in $names; do
+            remove_from_config "$name"
+        done
+        selected=()
+        fetch_sessions; build_display
+        search=""; action_idx=0
+        [[ $sel -gt $#selectable ]] && sel=$#selectable
+        [[ $sel -lt 1 ]] && sel=1
+    fi
+    stty -echo raw; printf '\e[?25l'
+}
+
+toggle_select() {
+    is_on_new && return
+    local name="$(current_session_name)"
+    [[ -n "$name" ]] || return
+    if [[ -n "${selected[$name]}" ]]; then
+        unset "selected[$name]"
+    else
+        selected[$name]=1
+    fi
 }
 
 do_current_action() {
@@ -593,8 +659,14 @@ while true; do
     if [[ "$key" == $'\e' ]]; then
         read -rsk1 -t 0.05 k2
         if [[ -z "$k2" ]]; then
-            # Esc: clear search and reset action
-            search=""; sel=1; viewport_top=1; action_idx=0
+            # Esc: staged — clear search first, then selection, then reset action
+            if [[ -n "$search" ]]; then
+                search=""; sel=1; viewport_top=1
+            elif [[ ${#selected} -gt 0 ]]; then
+                selected=()
+            else
+                action_idx=0
+            fi
             draw; continue
         else
             read -rsk1 -t 0.05 k3; key="${key}${k2}${k3}"
@@ -604,6 +676,9 @@ while true; do
     case "$key" in
         $'\e[A'|$'\eOA') nav_up ;;
         $'\e[B'|$'\eOB') nav_down ;;
+        ' ')
+            # Space: toggle bulk-selection of highlighted session, advance
+            toggle_select; nav_down ;;
         $'\t')
             # Tab: cycle action forward
             action_idx=$(( (action_idx + 1) % 3 )) ;;

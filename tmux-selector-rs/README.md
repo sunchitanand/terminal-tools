@@ -35,14 +35,31 @@ Debug: `--list` fetches and prints sessions, no TUI (used for smoke testing).
 |------------|-----------------------------------------|
 | type       | live fuzzy search                       |
 | ↑ / ↓      | move cursor (skips non-matches)         |
-| Tab / ⇧Tab | cycle action: attach → rename → delete  |
+| Tab / ⇧Tab | cycle action: attach → rename → move → archive → delete |
 | Enter      | run current action (Attach by default)  |
-| Space      | pick / unpick for bulk delete           |
+| Space      | pick / unpick for bulk actions          |
+| Ctrl-A     | toggle the archived-only view           |
 | Esc        | staged clear: search → selection → action |
 | q          | quit (when not searching)               |
 | Ctrl-C     | quit                                    |
 
 Enter always attaches (or creates) unless Tab has cycled the action.
+
+## Archive
+
+Sessions you don't need in the active list but want to return to later can be
+**archived** — they drop out of the main list without touching anything on the
+cloud desktop (the tmux session and its working directory are untouched).
+
+- Cycle the action to **archive** (Tab) and Enter, or pick several with Space
+  and archive them in one go.
+- **Ctrl-A** flips to the archived-only view; there the action reads
+  **unarchive** to bring a session back.
+- Archived sessions keep their dir, so unarchiving restores them exactly where
+  they were.
+- Archive state lives in `~/.tmux-archived.json` (per host), kept separate from
+  `~/.tmux-projects.json` so the projects file stays compatible with the zsh
+  script.
 
 ## Switching over
 

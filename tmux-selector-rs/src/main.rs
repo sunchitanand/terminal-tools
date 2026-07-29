@@ -5,7 +5,7 @@ mod ui;
 
 use anyhow::Result;
 use app::{Action, App, Prompt};
-use config::Config;
+use config::{Archive, Config};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
@@ -31,6 +31,10 @@ enum Outcome {
     ExecDelete { names: Vec<String> },
     ExecRename { old: String, new: String },
     ExecMove { names: Vec<String>, target: String },
+    /// Archive (or unarchive) these sessions — a local view flag, no ssh.
+    ExecArchive { names: Vec<String>, archive: bool },
+    /// Flip between the active list and the archived-only view.
+    ToggleArchivedView,
     None,
 }
 
@@ -45,15 +49,21 @@ fn main() -> Result<()> {
 
     let remote = Remote::new(host.clone(), use_mosh);
     let mut cfg = Config::load(&host);
+    let mut archive = Archive::load(&host);
 
     // Hidden debug flag: fetch + print the session list, no TUI. Used to smoke
     // test the SSH layer without entering the alternate screen.
     if args.iter().any(|a| a == "--list") {
         let sessions = fetch_and_persist(&remote, &mut cfg);
         for s in &sessions {
+            let tag = if archive.is_archived(&s.name) {
+                " [archived]"
+            } else {
+                ""
+            };
             println!(
-                "{}\trunning={}\tactivity={:?}\tdir={}",
-                s.name, s.running, s.activity, s.dir
+                "{}\trunning={}\tactivity={:?}\tdir={}{}",
+                s.name, s.running, s.activity, s.dir, tag
             );
         }
         return Ok(());
@@ -63,12 +73,12 @@ fn main() -> Result<()> {
     remote.deploy_helper();
 
     let sessions = fetch_and_persist(&remote, &mut cfg);
-    let mut app = App::new(sessions);
+    let mut app = App::with_archived(sessions, archive.names().into_iter().collect());
 
     // Enter TUI.
     let mut terminal = setup_terminal()?;
 
-    let result = run(&mut terminal, &mut app, &remote, &mut cfg);
+    let result = run(&mut terminal, &mut app, &remote, &mut cfg, &mut archive);
 
     restore_terminal(&mut terminal)?;
     result
@@ -110,7 +120,13 @@ fn restore_terminal(terminal: &mut Term) -> Result<()> {
 /// Main loop. Draws, reads events, and routes them. Confirmations and text
 /// input are handled as in-TUI modals; only attach/new-session (which must
 /// hand the terminal to ssh) leave the fullscreen UI.
-fn run(terminal: &mut Term, app: &mut App, remote: &Remote, cfg: &mut Config) -> Result<()> {
+fn run(
+    terminal: &mut Term,
+    app: &mut App,
+    remote: &Remote,
+    cfg: &mut Config,
+    archive: &mut Archive,
+) -> Result<()> {
     // Persisted across frames so mouse events can hit-test against the last
     // rendered layout.
     let mut map = MouseMap::default();
@@ -149,10 +165,26 @@ fn run(terminal: &mut Term, app: &mut App, remote: &Remote, cfg: &mut Config) ->
                 exec_delete(app, remote, cfg, terminal, &mut map, names)?;
             }
             Outcome::ExecRename { old, new } => {
-                exec_rename(app, remote, cfg, old, new);
+                exec_rename(app, remote, cfg, archive, old, new);
             }
             Outcome::ExecMove { names, target } => {
-                exec_move(app, remote, cfg, names, target);
+                exec_move(app, remote, cfg, archive, names, target);
+            }
+            Outcome::ExecArchive { names, archive: on } => {
+                for n in &names {
+                    archive.set(n, on);
+                }
+                let _ = archive.save();
+                app.set_archived(archive.names().into_iter().collect());
+                app.clear_picked();
+                // If unarchiving from the archived view emptied it, the cursor
+                // is clamped by set_archived -> rebuild.
+                if app.cursor >= app.selectable.len() {
+                    app.cursor = app.selectable.len().saturating_sub(1);
+                }
+            }
+            Outcome::ToggleArchivedView => {
+                app.toggle_archived_view();
             }
 
             // These hand the terminal to ssh, then the program exits on detach.
@@ -221,7 +253,14 @@ fn exec_delete(
     Ok(())
 }
 
-fn exec_rename(app: &mut App, remote: &Remote, cfg: &mut Config, old: String, new: String) {
+fn exec_rename(
+    app: &mut App,
+    remote: &Remote,
+    cfg: &mut Config,
+    archive: &mut Archive,
+    old: String,
+    new: String,
+) {
     app.cancel_prompt();
     if new.is_empty() || new == old {
         return;
@@ -238,15 +277,29 @@ fn exec_rename(app: &mut App, remote: &Remote, cfg: &mut Config, old: String, ne
         cfg.remove(&old);
         cfg.upsert(&new, &dir);
         let _ = cfg.save();
+        // Keep archive membership attached to the renamed session.
+        if archive.is_archived(&old) {
+            archive.rename(&old, &new);
+            let _ = archive.save();
+            app.set_archived(archive.names().into_iter().collect());
+        }
     }
     refresh(app, remote, cfg);
 }
 
-fn exec_move(app: &mut App, remote: &Remote, cfg: &mut Config, names: Vec<String>, target: String) {
+fn exec_move(
+    app: &mut App,
+    remote: &Remote,
+    cfg: &mut Config,
+    archive: &mut Archive,
+    names: Vec<String>,
+    target: String,
+) {
     app.cancel_prompt();
     if target.trim().is_empty() {
         return;
     }
+    let mut archive_dirty = false;
     for old in &names {
         let new_name = app::moved_name(old, &target);
         if new_name == *old {
@@ -265,9 +318,18 @@ fn exec_move(app: &mut App, remote: &Remote, cfg: &mut Config, names: Vec<String
             }
             cfg.remove(old);
             cfg.upsert(&new_name, &dir);
+            // Keep archive membership attached to the renamed session.
+            if archive.is_archived(old) {
+                archive.rename(old, &new_name);
+                archive_dirty = true;
+            }
         }
     }
     let _ = cfg.save();
+    if archive_dirty {
+        let _ = archive.save();
+        app.set_archived(archive.names().into_iter().collect());
+    }
     app.clear_picked();
     refresh(app, remote, cfg);
 }
@@ -362,10 +424,11 @@ fn handle_mouse(app: &mut App, m: MouseEvent, map: &MouseMap) -> Outcome {
             // Action bar takes priority (it sits below the table).
             if let Some(action) = map.hit_action(m.column, m.row) {
                 app.action = action;
-                // Clicking "delete N" / "move N" while sessions are picked
-                // fires the bulk action immediately (matches the keyboard flow).
+                // Clicking "delete N" / "move N" / "archive N" while sessions
+                // are picked fires the bulk action immediately (matches the
+                // keyboard flow).
                 if !app.picked.is_empty()
-                    && matches!(action, Action::Delete | Action::Move)
+                    && matches!(action, Action::Delete | Action::Move | Action::Archive)
                 {
                     return decide_action(app);
                 }
@@ -423,6 +486,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Outcome {
             Outcome::None
         }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Outcome::Quit,
+        // Ctrl-A flips between the active list and the archived-only view.
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Outcome::ToggleArchivedView
+        }
         KeyCode::Char('q') if app.search.is_empty() => Outcome::Quit,
         KeyCode::Char(c) => {
             app.push_search(c);
@@ -488,6 +555,24 @@ fn decide_action(app: &mut App) -> Outcome {
             };
             app.open_move(names);
             Outcome::None
+        }
+        Action::Archive => {
+            let names = if !app.picked.is_empty() {
+                app.picked_names()
+            } else if app.on_new() {
+                return Outcome::None;
+            } else {
+                match app.current_name() {
+                    Some(name) => vec![name],
+                    None => return Outcome::None,
+                }
+            };
+            // Archiving is reversible, so no confirm modal. In the archived
+            // view this un-archives; in the normal view it archives.
+            Outcome::ExecArchive {
+                names,
+                archive: !app.show_archived,
+            }
         }
         Action::Delete => {
             let names = if !app.picked.is_empty() {

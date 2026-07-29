@@ -283,15 +283,31 @@ fn enter_esc_hint<'a>(dim: Style, cyan: Style) -> Line<'a> {
 }
 
 fn render_title(f: &mut Frame, area: Rect, ctx: &RenderCtx) {
-    let line = Line::from(vec![
+    let app = ctx.app;
+    let mut spans = vec![
         Span::raw("  "),
         Span::styled("⚡ tmux :: ", Style::default().fg(ACCENT)),
         Span::styled(
             ctx.host_short.to_string(),
             Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
         ),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
+    ];
+    if app.show_archived {
+        // Clear text label — colorblind-safe, meaning is in the word.
+        spans.push(Span::styled(
+            "   [ARCHIVED VIEW]",
+            Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        let n = app.archived_count();
+        if n > 0 {
+            spans.push(Span::styled(
+                format!("   ({n} archived · ^A)"),
+                Style::default().fg(DIM),
+            ));
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_table(f: &mut Frame, area: Rect, ctx: &RenderCtx, map: &mut MouseMap) {
@@ -495,19 +511,31 @@ fn render_action_bar(f: &mut Frame, area: Rect, ctx: &RenderCtx, map: &mut Mouse
 
     let mut spans = vec![Span::raw("  ")];
     col += 2;
-    for (i, act) in [Action::Attach, Action::Rename, Action::Move, Action::Delete]
-        .iter()
-        .enumerate()
-    {
+    let actions = [
+        Action::Attach,
+        Action::Rename,
+        Action::Move,
+        Action::Archive,
+        Action::Delete,
+    ];
+    for (i, act) in actions.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled("│", Style::default().fg(DIM)));
             col += 1;
         }
-        // Delete and Move show the pick count when sessions are selected.
-        let label = if nsel > 0 && matches!(*act, Action::Delete | Action::Move) {
-            format!("  {} {nsel}  ", act.label())
+        // In the archived view, the archive action reads "unarchive".
+        let verb = if *act == Action::Archive && app.show_archived {
+            "unarchive"
         } else {
-            format!("  {}  ", act.label())
+            act.label()
+        };
+        // Bulk-capable actions show the pick count when sessions are selected.
+        let label = if nsel > 0
+            && matches!(*act, Action::Delete | Action::Move | Action::Archive)
+        {
+            format!("  {verb} {nsel}  ")
+        } else {
+            format!("  {verb}  ")
         };
         let width = label.chars().count() as u16;
         let style = if *act == app.action {
@@ -551,6 +579,11 @@ fn render_hint(f: &mut Frame, area: Rect, ctx: &RenderCtx) {
             Span::raw(" clear"),
         ]
     } else {
+        let archive_hint = if app.show_archived {
+            " active"
+        } else {
+            " archived"
+        };
         vec![
             Span::raw("  "),
             Span::styled("↑↓/click", dim),
@@ -561,6 +594,9 @@ fn render_hint(f: &mut Frame, area: Rect, ctx: &RenderCtx) {
             Span::raw(" action  "),
             Span::styled("␣", dim),
             Span::raw(" pick  "),
+            Span::styled("^A", dim),
+            Span::raw(archive_hint),
+            Span::raw("  "),
             Span::styled("q", dim),
             Span::raw(" quit"),
         ]

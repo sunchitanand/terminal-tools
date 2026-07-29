@@ -22,6 +22,7 @@ pub enum Action {
     Attach,
     Rename,
     Move,
+    Archive,
     Delete,
 }
 
@@ -30,7 +31,8 @@ impl Action {
         match self {
             Action::Attach => Action::Rename,
             Action::Rename => Action::Move,
-            Action::Move => Action::Delete,
+            Action::Move => Action::Archive,
+            Action::Archive => Action::Delete,
             Action::Delete => Action::Attach,
         }
     }
@@ -39,7 +41,8 @@ impl Action {
             Action::Attach => Action::Delete,
             Action::Rename => Action::Attach,
             Action::Move => Action::Rename,
-            Action::Delete => Action::Move,
+            Action::Archive => Action::Move,
+            Action::Delete => Action::Archive,
         }
     }
     pub fn label(self) -> &'static str {
@@ -47,6 +50,7 @@ impl Action {
             Action::Attach => "attach",
             Action::Rename => "rename",
             Action::Move => "move",
+            Action::Archive => "archive",
             Action::Delete => "delete",
         }
     }
@@ -94,10 +98,24 @@ pub struct App {
     pub prompt: Prompt,
     /// Transient status line (e.g. "Deleting 3…") shown during a blocking op.
     pub status: Option<String>,
+    /// Archived session names — hidden from the active list unless
+    /// `show_archived` is on. The cloud folder is untouched; this is a view
+    /// concept so the active list doesn't grow without bound.
+    pub archived: HashSet<String>,
+    /// When true, the list shows ONLY archived sessions (the archive view);
+    /// when false, archived sessions are hidden.
+    pub show_archived: bool,
 }
 
 impl App {
+    /// Construct with no archived sessions. Used by tests and as the natural
+    /// public constructor; the binary uses `with_archived` to seed the set.
+    #[allow(dead_code)]
     pub fn new(sessions: Vec<Session>) -> Self {
+        Self::with_archived(sessions, HashSet::new())
+    }
+
+    pub fn with_archived(sessions: Vec<Session>, archived: HashSet<String>) -> Self {
         let mut app = App {
             sessions,
             rows: Vec::new(),
@@ -108,6 +126,8 @@ impl App {
             picked: HashSet::new(),
             prompt: Prompt::None,
             status: None,
+            archived,
+            show_archived: false,
         };
         app.rebuild();
         app
@@ -118,6 +138,26 @@ impl App {
         self.rebuild();
     }
 
+    /// Replace the archived set (after a fetch/persist round-trip).
+    pub fn set_archived(&mut self, archived: HashSet<String>) {
+        self.archived = archived;
+        self.rebuild();
+    }
+
+    /// Toggle between the active list and the archived-only view.
+    pub fn toggle_archived_view(&mut self) {
+        self.show_archived = !self.show_archived;
+        self.picked.clear();
+        self.search.clear();
+        self.cursor = 0;
+        self.action = Action::Attach;
+        self.rebuild();
+    }
+
+    pub fn archived_count(&self) -> usize {
+        self.archived.len()
+    }
+
     /// Rebuild `rows` and `selectable` from `sessions`. Groups by project
     /// prefix, orders projects by their most-recently-active session (most
     /// recent group first, "other" last), and orders sessions within a project
@@ -126,14 +166,22 @@ impl App {
         self.rows.clear();
         self.selectable.clear();
 
-        // "+ New session" first.
-        self.rows.push(Row::New);
+        // "+ New session" first — but not in the archived view (you don't
+        // create sessions there).
+        if !self.show_archived {
+            self.rows.push(Row::New);
+        }
 
-        // Group session indices by project.
+        // Group session indices by project, filtered by the active view:
+        // the archived view shows only archived sessions; the normal view
+        // hides them.
         let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
         let mut index_of: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         for (i, s) in self.sessions.iter().enumerate() {
+            if self.archived.contains(&s.name) != self.show_archived {
+                continue;
+            }
             let proj = match s.name.split_once('/') {
                 Some((p, _)) => p.to_string(),
                 None => "other".to_string(),
@@ -585,12 +633,58 @@ mod tests {
         }
     }
 
+    fn session_names(app: &App) -> Vec<String> {
+        app.rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Session(i) => Some(app.sessions[*i].name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn fuzzy_subsequence() {
         assert!(App::fuzzy("replay/mainline", "rml"));
         assert!(App::fuzzy("replay/mainline", "MAIN"));
         assert!(!App::fuzzy("replay/mainline", "xyz"));
         assert!(App::fuzzy("anything", "")); // empty matches
+    }
+
+    #[test]
+    fn archived_sessions_hidden_from_active_list() {
+        let mut archived = HashSet::new();
+        archived.insert("alpha/old".to_string());
+        let app = App::with_archived(
+            vec![sess("alpha/old", false, 1), sess("alpha/live", true, 2)],
+            archived,
+        );
+        // Active view hides the archived one.
+        assert_eq!(session_names(&app), vec!["alpha/live"]);
+    }
+
+    #[test]
+    fn archived_view_shows_only_archived_and_no_new_row() {
+        let mut archived = HashSet::new();
+        archived.insert("alpha/old".to_string());
+        let mut app = App::with_archived(
+            vec![sess("alpha/old", false, 1), sess("alpha/live", true, 2)],
+            archived,
+        );
+        app.toggle_archived_view();
+        assert!(app.show_archived);
+        assert_eq!(session_names(&app), vec!["alpha/old"]);
+        // No "+ New session" row in the archived view.
+        assert!(!app.rows.iter().any(|r| matches!(r, Row::New)));
+    }
+
+    #[test]
+    fn archived_count_reflects_set() {
+        let mut archived = HashSet::new();
+        archived.insert("a".to_string());
+        archived.insert("b".to_string());
+        let app = App::with_archived(vec![sess("a", false, 1)], archived);
+        assert_eq!(app.archived_count(), 2);
     }
 
     #[test]

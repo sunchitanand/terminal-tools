@@ -21,6 +21,7 @@ pub enum Row {
 pub enum Action {
     Attach,
     Rename,
+    Move,
     Delete,
 }
 
@@ -28,7 +29,8 @@ impl Action {
     pub fn next(self) -> Action {
         match self {
             Action::Attach => Action::Rename,
-            Action::Rename => Action::Delete,
+            Action::Rename => Action::Move,
+            Action::Move => Action::Delete,
             Action::Delete => Action::Attach,
         }
     }
@@ -36,15 +38,44 @@ impl Action {
         match self {
             Action::Attach => Action::Delete,
             Action::Rename => Action::Attach,
-            Action::Delete => Action::Rename,
+            Action::Move => Action::Rename,
+            Action::Delete => Action::Move,
         }
     }
     pub fn label(self) -> &'static str {
         match self {
             Action::Attach => "attach",
             Action::Rename => "rename",
+            Action::Move => "move",
             Action::Delete => "delete",
         }
+    }
+}
+
+/// A modal prompt drawn over the list. While active, key input is routed to it
+/// instead of the list, so confirmations/inputs stay inside the TUI rather than
+/// dropping back to the shell.
+#[derive(Clone, Debug)]
+pub enum Prompt {
+    None,
+    /// y/n confirmation before deleting these sessions.
+    ConfirmDelete { names: Vec<String> },
+    /// Text input for renaming a single session (buffer pre-filled with `old`).
+    Rename { old: String, buffer: String },
+    /// Target-project picker when moving these sessions. Instead of typing, the
+    /// user cycles `candidates` with up/down; `selected` is the current choice.
+    MoveTo {
+        names: Vec<String>,
+        candidates: Vec<String>,
+        selected: usize,
+    },
+    /// Text input for a new session name.
+    NewSession { buffer: String },
+}
+
+impl Prompt {
+    pub fn is_active(&self) -> bool {
+        !matches!(self, Prompt::None)
     }
 }
 
@@ -59,6 +90,10 @@ pub struct App {
     pub action: Action,
     /// Bulk-selection set, keyed by session name (stable across refetch).
     pub picked: HashSet<String>,
+    /// Active modal prompt, if any.
+    pub prompt: Prompt,
+    /// Transient status line (e.g. "Deleting 3…") shown during a blocking op.
+    pub status: Option<String>,
 }
 
 impl App {
@@ -71,6 +106,8 @@ impl App {
             search: String::new(),
             action: Action::Attach,
             picked: HashSet::new(),
+            prompt: Prompt::None,
+            status: None,
         };
         app.rebuild();
         app
@@ -82,8 +119,9 @@ impl App {
     }
 
     /// Rebuild `rows` and `selectable` from `sessions`. Groups by project
-    /// prefix, sorts projects alphabetically ("other" last), and orders
-    /// sessions within a project by activity descending.
+    /// prefix, orders projects by their most-recently-active session (most
+    /// recent group first, "other" last), and orders sessions within a project
+    /// by activity descending.
     pub fn rebuild(&mut self) {
         self.rows.clear();
         self.selectable.clear();
@@ -109,12 +147,25 @@ impl App {
             }
         }
 
-        // Sort project names alphabetically, "other" last.
+        // Each group's rank = the max activity_ts across its sessions, so a
+        // project bubbles to the top whenever any of its sessions was used
+        // recently. Sort by that rank descending; "other" is always pinned
+        // last regardless of recency.
+        let group_rank = |idxs: &[usize]| -> i64 {
+            idxs.iter()
+                .map(|&i| self.sessions[i].activity_ts)
+                .max()
+                .unwrap_or(0)
+        };
         groups.sort_by(|a, b| match (a.0.as_str(), b.0.as_str()) {
             ("other", "other") => std::cmp::Ordering::Equal,
             ("other", _) => std::cmp::Ordering::Greater,
             (_, "other") => std::cmp::Ordering::Less,
-            (x, y) => x.cmp(y),
+            _ => group_rank(&b.1)
+                .cmp(&group_rank(&a.1))
+                // Tie-break alphabetically for stable ordering (e.g. offline
+                // projects whose sessions all have activity_ts 0).
+                .then_with(|| a.0.cmp(&b.0)),
         });
 
         for (proj, mut idxs) in groups {
@@ -319,6 +370,127 @@ impl App {
         self.current_session().map(|s| s.dir.clone())
     }
 
+    // --- Modal prompt lifecycle ---
+
+    pub fn open_new_session(&mut self) {
+        self.prompt = Prompt::NewSession {
+            buffer: String::new(),
+        };
+    }
+
+    pub fn open_rename(&mut self, old: String) {
+        self.prompt = Prompt::Rename {
+            buffer: old.clone(),
+            old,
+        };
+    }
+
+    pub fn open_move(&mut self, names: Vec<String>) {
+        // Candidate target projects = existing projects, plus "other" so a
+        // session can be moved out of any project into the ungrouped bucket.
+        let mut candidates = self.project_names();
+        candidates.push("other".to_string());
+        // Start on the project the (first) session is currently in, if any, so
+        // the initial highlight is a sensible no-op rather than a stray move.
+        let current_proj = names
+            .first()
+            .and_then(|n| n.split_once('/').map(|(p, _)| p.to_string()))
+            .unwrap_or_else(|| "other".to_string());
+        let selected = candidates
+            .iter()
+            .position(|c| *c == current_proj)
+            .unwrap_or(0);
+        self.prompt = Prompt::MoveTo {
+            names,
+            candidates,
+            selected,
+        };
+    }
+
+    /// Cycle the move-target selection up/down (wraps). No-op for other prompts.
+    pub fn move_prev(&mut self) {
+        if let Prompt::MoveTo {
+            candidates,
+            selected,
+            ..
+        } = &mut self.prompt
+        {
+            if !candidates.is_empty() {
+                *selected = if *selected == 0 {
+                    candidates.len() - 1
+                } else {
+                    *selected - 1
+                };
+            }
+        }
+    }
+
+    pub fn move_next(&mut self) {
+        if let Prompt::MoveTo {
+            candidates,
+            selected,
+            ..
+        } = &mut self.prompt
+        {
+            if !candidates.is_empty() {
+                *selected = (*selected + 1) % candidates.len();
+            }
+        }
+    }
+
+    /// The currently highlighted target project in a move prompt.
+    pub fn move_selected_project(&self) -> Option<String> {
+        if let Prompt::MoveTo {
+            candidates,
+            selected,
+            ..
+        } = &self.prompt
+        {
+            candidates.get(*selected).cloned()
+        } else {
+            None
+        }
+    }
+
+    pub fn open_confirm_delete(&mut self, names: Vec<String>) {
+        self.prompt = Prompt::ConfirmDelete { names };
+    }
+
+    pub fn cancel_prompt(&mut self) {
+        self.prompt = Prompt::None;
+    }
+
+    /// Append a char to the active text prompt's buffer (no-op for confirm and
+    /// for the move picker, which is arrow-driven).
+    pub fn prompt_push(&mut self, c: char) {
+        match &mut self.prompt {
+            Prompt::Rename { buffer, .. } | Prompt::NewSession { buffer } => buffer.push(c),
+            _ => {}
+        }
+    }
+
+    /// Delete the last char of the active text prompt's buffer.
+    pub fn prompt_backspace(&mut self) {
+        match &mut self.prompt {
+            Prompt::Rename { buffer, .. } | Prompt::NewSession { buffer } => {
+                buffer.pop();
+            }
+            _ => {}
+        }
+    }
+
+    /// Distinct project names currently in use, sorted, "other" excluded. Used
+    /// to show the user their existing projects when moving a session.
+    pub fn project_names(&self) -> Vec<String> {
+        let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for s in &self.sessions {
+            if let Some((proj, _)) = s.name.split_once('/') {
+                set.insert(proj.to_string());
+            }
+        }
+        set.into_iter().collect()
+    }
+
     // --- Bulk selection ---
 
     pub fn toggle_pick(&mut self) {
@@ -377,6 +549,26 @@ impl App {
     }
 }
 
+/// The bare session name without its project prefix. `alpha/foo` -> `foo`;
+/// an ungrouped `bar` -> `bar`.
+pub fn session_suffix(name: &str) -> &str {
+    name.split_once('/').map(|(_, s)| s).unwrap_or(name)
+}
+
+/// Compute the new full name when moving `name` into `target_project`. The
+/// suffix is preserved. An empty (or "other") target strips the prefix so the
+/// session falls into the ungrouped "other" bucket. The project part is trimmed
+/// of surrounding whitespace and any stray slashes the user typed.
+pub fn moved_name(name: &str, target_project: &str) -> String {
+    let suffix = session_suffix(name);
+    let proj = target_project.trim().trim_matches('/');
+    if proj.is_empty() || proj == "other" {
+        suffix.to_string()
+    } else {
+        format!("{proj}/{suffix}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,22 +594,105 @@ mod tests {
     }
 
     #[test]
-    fn grouping_sorts_projects_other_last() {
+    fn move_picker_cycles_and_starts_on_current_project() {
+        let app_sessions = vec![
+            sess("alpha/x", true, 3),
+            sess("beta/y", true, 2),
+            sess("gamma/z", true, 1),
+        ];
+        let mut app = App::new(app_sessions);
+        // Move beta/y: candidates are the projects (sorted) + "other", and the
+        // initial selection lands on the session's current project "beta".
+        app.open_move(vec!["beta/y".to_string()]);
+        if let Prompt::MoveTo { candidates, .. } = &app.prompt {
+            assert_eq!(candidates, &["alpha", "beta", "gamma", "other"]);
+        } else {
+            panic!("expected MoveTo prompt");
+        }
+        assert_eq!(app.move_selected_project().as_deref(), Some("beta"));
+
+        // Down moves to gamma, then other, then wraps to alpha.
+        app.move_next();
+        assert_eq!(app.move_selected_project().as_deref(), Some("gamma"));
+        app.move_next();
+        assert_eq!(app.move_selected_project().as_deref(), Some("other"));
+        app.move_next();
+        assert_eq!(app.move_selected_project().as_deref(), Some("alpha"));
+
+        // Up from alpha wraps back to other.
+        app.move_prev();
+        assert_eq!(app.move_selected_project().as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn move_selected_project_none_when_not_moving() {
+        let app = App::new(vec![sess("alpha/x", true, 1)]);
+        assert_eq!(app.move_selected_project(), None);
+    }
+
+    #[test]
+    fn moved_name_preserves_suffix() {
+        // Move keeps the part after "/", only swaps the project prefix.
+        assert_eq!(moved_name("alpha/foo", "beta"), "beta/foo");
+        // Ungrouped session gains a project.
+        assert_eq!(moved_name("loose", "beta"), "beta/loose");
+        // Target "other" or empty strips the prefix into the ungrouped bucket.
+        assert_eq!(moved_name("alpha/foo", "other"), "foo");
+        assert_eq!(moved_name("alpha/foo", ""), "foo");
+        // Stray slashes / whitespace the user typed are trimmed.
+        assert_eq!(moved_name("alpha/foo", "  beta/  "), "beta/foo");
+    }
+
+    #[test]
+    fn session_suffix_extracts_tail() {
+        assert_eq!(session_suffix("alpha/foo"), "foo");
+        assert_eq!(session_suffix("loose"), "loose");
+    }
+
+    #[test]
+    fn project_names_are_distinct_sorted_no_other() {
         let app = App::new(vec![
-            sess("zeta/a", true, 1),
-            sess("alpha/b", true, 1),
-            sess("standalone", true, 1), // no slash -> "other"
+            sess("beta/x", true, 1),
+            sess("alpha/y", true, 1),
+            sess("beta/z", true, 1),
+            sess("loose", true, 1), // ungrouped -> excluded
         ]);
-        // rows[0] = New. Then headers alpha, zeta, other.
-        let headers: Vec<String> = app
-            .rows
+        assert_eq!(app.project_names(), vec!["alpha", "beta"]);
+    }
+
+    fn headers(app: &App) -> Vec<String> {
+        app.rows
             .iter()
             .filter_map(|r| match r {
                 Row::Header(h) => Some(h.clone()),
                 _ => None,
             })
-            .collect();
-        assert_eq!(headers, vec!["alpha", "zeta", "other"]);
+            .collect()
+    }
+
+    #[test]
+    fn grouping_ties_break_alphabetically_other_last() {
+        // Equal activity -> alphabetical tie-break; "other" pinned last.
+        let app = App::new(vec![
+            sess("zeta/a", true, 1),
+            sess("alpha/b", true, 1),
+            sess("standalone", true, 1), // no slash -> "other"
+        ]);
+        assert_eq!(headers(&app), vec!["alpha", "zeta", "other"]);
+    }
+
+    #[test]
+    fn projects_ordered_by_most_recent_session() {
+        // beta has the single most-recent session, so it bubbles to the top
+        // even though alpha sorts first alphabetically. gamma is oldest.
+        let app = App::new(vec![
+            sess("alpha/a1", true, 200),
+            sess("alpha/a2", true, 100),
+            sess("beta/b1", true, 999), // newest anywhere
+            sess("gamma/g1", true, 50),
+            sess("solo", true, 500), // -> "other", always last
+        ]);
+        assert_eq!(headers(&app), vec!["beta", "alpha", "gamma", "other"]);
     }
 
     #[test]

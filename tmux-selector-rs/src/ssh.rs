@@ -141,11 +141,6 @@ chmod +x ~/.cmux-kiro/set-env.sh"#;
         parse_and_merge(&raw, config_entries)
     }
 
-    pub fn kill_session(&self, name: &str) {
-        let cmd = format!("{} kill-session -t {}", self.rtmux, sh_quote(name));
-        let _ = self.ssh_capture(&cmd);
-    }
-
     /// Kill several sessions in a single ssh round-trip.
     pub fn kill_sessions(&self, names: &[String]) {
         if names.is_empty() {

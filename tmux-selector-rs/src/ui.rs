@@ -2,9 +2,9 @@
 //! with SESSION / STARTED / ACTIVE columns, project group headers, a running
 //! dot, a bulk-select tick, plus a search line and an action bar.
 
-use crate::app::{Action, App, Row};
+use crate::app::{Action, App, Prompt, Row};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row as TRow, Table, TableState};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row as TRow, Table, TableState};
 
 // Palette — warm, colorblind-safe (meaning carried by text + symbols, not hue).
 const ACCENT: Color = Color::Magenta; // title / headers
@@ -100,6 +100,186 @@ pub fn render(f: &mut Frame, ctx: &RenderCtx, map: &mut MouseMap) {
     render_table(f, chunks[1], ctx, map);
     render_action_bar(f, chunks[3], ctx, map);
     render_hint(f, chunks[4], ctx);
+
+    // Transient status line (e.g. "Deleting 3…") replaces the hint briefly.
+    if let Some(msg) = &ctx.app.status {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(msg.clone(), Style::default().fg(YELLOW)),
+            ])),
+            chunks[4],
+        );
+    }
+
+    // Modal prompt drawn last, over everything else.
+    if ctx.app.prompt.is_active() {
+        render_prompt(f, area, ctx);
+    }
+}
+
+/// Center a `w`×`h` rect within `area` (clamped to fit).
+fn centered(area: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 3; // upper-third looks better
+    Rect { x, y, width: w, height: h }
+}
+
+/// Draw the active modal prompt as a centered popup over the list.
+fn render_prompt(f: &mut Frame, area: Rect, ctx: &RenderCtx) {
+    let app = ctx.app;
+    let accent = Style::default().fg(ACCENT);
+    let cyan = Style::default().fg(CYAN);
+    let dim = Style::default().fg(DIM);
+
+    // Build the popup's inner lines (title, optional context, input/confirm).
+    let (title, body): (String, Vec<Line>) = match &app.prompt {
+        Prompt::ConfirmDelete { names } => {
+            let title = "Delete".to_string();
+            let mut body = Vec::new();
+            if names.len() == 1 {
+                body.push(Line::from(vec![
+                    Span::raw("Delete "),
+                    Span::styled(names[0].clone(), accent),
+                    Span::raw("?"),
+                ]));
+            } else {
+                body.push(Line::from(vec![
+                    Span::raw("Delete "),
+                    Span::styled(format!("{} sessions", names.len()), accent),
+                    Span::raw("?"),
+                ]));
+                // Show up to a few names for context.
+                let preview: Vec<String> = names.iter().take(4).cloned().collect();
+                let mut extra = preview.join(", ");
+                if names.len() > 4 {
+                    extra.push_str(&format!(", +{} more", names.len() - 4));
+                }
+                body.push(Line::from(Span::styled(extra, dim)));
+            }
+            body.push(Line::from(""));
+            body.push(Line::from(vec![
+                Span::styled("y", cyan),
+                Span::styled(" delete    ", dim),
+                Span::styled("n", cyan),
+                Span::styled("/", dim),
+                Span::styled("esc", cyan),
+                Span::styled(" cancel", dim),
+            ]));
+            (title, body)
+        }
+        Prompt::Rename { old, buffer } => {
+            let body = vec![
+                Line::from(vec![
+                    Span::styled("renaming ", dim),
+                    Span::styled(old.clone(), dim),
+                ]),
+                Line::from(""),
+                input_line(buffer, cyan),
+                Line::from(""),
+                enter_esc_hint(dim, cyan),
+            ];
+            ("Rename".to_string(), body)
+        }
+        Prompt::MoveTo {
+            names,
+            candidates,
+            selected,
+        } => {
+            let mut body = Vec::new();
+            let label = if names.len() == 1 {
+                format!("move {}", names[0])
+            } else {
+                format!("move {} sessions", names.len())
+            };
+            body.push(Line::from(Span::styled(label, dim)));
+            body.push(Line::from(""));
+            // One line per candidate project; the selected one is highlighted
+            // with a chevron + inverse style. Up/down cycles the selection.
+            for (i, proj) in candidates.iter().enumerate() {
+                if i == *selected {
+                    body.push(Line::from(vec![
+                        Span::styled("› ", cyan),
+                        Span::styled(
+                            proj.clone(),
+                            Style::default()
+                                .bg(Color::Blue)
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                } else {
+                    body.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(proj.clone(), Style::default().fg(Color::White)),
+                    ]));
+                }
+            }
+            body.push(Line::from(""));
+            body.push(Line::from(vec![
+                Span::styled("↑↓", cyan),
+                Span::styled(" pick    ", dim),
+                Span::styled("↵", cyan),
+                Span::styled(" confirm    ", dim),
+                Span::styled("esc", cyan),
+                Span::styled(" cancel", dim),
+            ]));
+            ("Move to project".to_string(), body)
+        }
+        Prompt::NewSession { buffer } => {
+            let body = vec![
+                Line::from(Span::styled("name as project/name", dim)),
+                Line::from(""),
+                input_line(buffer, cyan),
+                Line::from(""),
+                enter_esc_hint(dim, cyan),
+            ];
+            ("New session".to_string(), body)
+        }
+        Prompt::None => return,
+    };
+
+    // Size: width fits content (min 40, max area-4), height = body + borders.
+    let content_w = body
+        .iter()
+        .map(|l| l.width())
+        .max()
+        .unwrap_or(0)
+        .max(title.len())
+        .max(38) as u16
+        + 4;
+    let w = content_w.min(area.width.saturating_sub(4));
+    let h = body.len() as u16 + 2; // top/bottom border
+    let popup = centered(area, w, h);
+
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(accent)
+        .title(Span::styled(format!(" {title} "), accent.add_modifier(Modifier::BOLD)));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    f.render_widget(Paragraph::new(body), inner);
+}
+
+/// A text-input display line: "> buffer█".
+fn input_line<'a>(buffer: &str, cyan: Style) -> Line<'a> {
+    Line::from(vec![
+        Span::styled("> ", cyan),
+        Span::styled(buffer.to_string(), Style::default().fg(Color::White)),
+        Span::styled("█", cyan),
+    ])
+}
+
+fn enter_esc_hint<'a>(dim: Style, cyan: Style) -> Line<'a> {
+    Line::from(vec![
+        Span::styled("↵", cyan),
+        Span::styled(" confirm    ", dim),
+        Span::styled("esc", cyan),
+        Span::styled(" cancel", dim),
+    ])
 }
 
 fn render_title(f: &mut Frame, area: Rect, ctx: &RenderCtx) {
@@ -315,7 +495,7 @@ fn render_action_bar(f: &mut Frame, area: Rect, ctx: &RenderCtx, map: &mut Mouse
 
     let mut spans = vec![Span::raw("  ")];
     col += 2;
-    for (i, act) in [Action::Attach, Action::Rename, Action::Delete]
+    for (i, act) in [Action::Attach, Action::Rename, Action::Move, Action::Delete]
         .iter()
         .enumerate()
     {
@@ -323,8 +503,9 @@ fn render_action_bar(f: &mut Frame, area: Rect, ctx: &RenderCtx, map: &mut Mouse
             spans.push(Span::styled("│", Style::default().fg(DIM)));
             col += 1;
         }
-        let label = if *act == Action::Delete && nsel > 0 {
-            format!("  delete {nsel}  ")
+        // Delete and Move show the pick count when sessions are selected.
+        let label = if nsel > 0 && matches!(*act, Action::Delete | Action::Move) {
+            format!("  {} {nsel}  ", act.label())
         } else {
             format!("  {}  ", act.label())
         };

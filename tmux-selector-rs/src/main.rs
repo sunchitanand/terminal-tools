@@ -4,7 +4,7 @@ mod ssh;
 mod ui;
 
 use anyhow::Result;
-use app::{Action, App};
+use app::{Action, App, Prompt};
 use config::Config;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -16,18 +16,21 @@ use crossterm::terminal::{
 };
 use ratatui::prelude::*;
 use ssh::{Remote, SessionAction};
-use std::io::{self, Write};
+use std::io::{self};
 use ui::MouseMap;
 
-/// What the event loop asks the outer driver to do after breaking out of the
-/// alternate screen (interactive things that need the real terminal).
+/// What the event loop should do next. Two flavours:
+/// - `Attach` / `NewSessionNamed` hand the terminal to ssh (they leave the
+///   alternate screen and then the program exits after detach).
+/// - `Exec*` run a quick non-interactive ssh call *without* leaving the TUI —
+///   the confirmation and result stay inside the fullscreen UI.
 enum Outcome {
     Quit,
     Attach(SessionAction),
-    Rename { old: String },
-    Delete { name: String },
-    BulkDelete { names: Vec<String> },
-    NewSession,
+    NewSessionNamed { name: String },
+    ExecDelete { names: Vec<String> },
+    ExecRename { old: String, new: String },
+    ExecMove { names: Vec<String>, target: String },
     None,
 }
 
@@ -104,8 +107,9 @@ fn restore_terminal(terminal: &mut Term) -> Result<()> {
     Ok(())
 }
 
-/// Main loop. Draws, reads keys, and — for interactive actions — leaves the
-/// alternate screen, performs the action, then re-enters and refreshes.
+/// Main loop. Draws, reads events, and routes them. Confirmations and text
+/// input are handled as in-TUI modals; only attach/new-session (which must
+/// hand the terminal to ssh) leave the fullscreen UI.
 fn run(terminal: &mut Term, app: &mut App, remote: &Remote, cfg: &mut Config) -> Result<()> {
     // Persisted across frames so mouse events can hit-test against the last
     // rendered layout.
@@ -124,24 +128,220 @@ fn run(terminal: &mut Term, app: &mut App, remote: &Remote, cfg: &mut Config) ->
         })?;
 
         let outcome = match event::read()? {
-            Event::Key(key) if key.kind == event::KeyEventKind::Press => handle_key(app, key),
-            Event::Mouse(m) => handle_mouse(app, m, &map),
+            Event::Key(key) if key.kind == event::KeyEventKind::Press => {
+                if app.prompt.is_active() {
+                    handle_prompt_key(app, key)
+                } else {
+                    handle_key(app, key)
+                }
+            }
+            // Mouse is ignored while a modal is open.
+            Event::Mouse(m) if !app.prompt.is_active() => handle_mouse(app, m, &map),
             _ => Outcome::None,
         };
 
         match outcome {
             Outcome::Quit => return Ok(()),
             Outcome::None => {}
-            interactive => {
-                // Suspend TUI, do the interactive thing, then resume.
+
+            // These run a quick ssh call in-place and redraw — no screen leave.
+            Outcome::ExecDelete { names } => {
+                exec_delete(app, remote, cfg, terminal, &mut map, names)?;
+            }
+            Outcome::ExecRename { old, new } => {
+                exec_rename(app, remote, cfg, old, new);
+            }
+            Outcome::ExecMove { names, target } => {
+                exec_move(app, remote, cfg, names, target);
+            }
+
+            // These hand the terminal to ssh, then the program exits on detach.
+            Outcome::Attach(action) => {
                 suspend(terminal)?;
-                let should_exit = perform(interactive, app, remote, cfg)?;
-                if should_exit {
-                    return Ok(());
-                }
-                resume(terminal)?;
+                remote.run_interactive(action)?;
+                return Ok(());
+            }
+            Outcome::NewSessionNamed { name } => {
+                cfg.upsert(&name, "");
+                let _ = cfg.save();
+                suspend(terminal)?;
+                remote.run_interactive(SessionAction::New { name })?;
+                return Ok(());
             }
         }
+    }
+}
+
+/// Draw a transient status line (e.g. "Deleting 3…") before a blocking ssh
+/// call, so the UI doesn't look frozen.
+fn draw_status(
+    terminal: &mut Term,
+    app: &mut App,
+    remote: &Remote,
+    map: &mut MouseMap,
+    msg: &str,
+) -> Result<()> {
+    app.status = Some(msg.to_string());
+    terminal.draw(|f| {
+        ui::render(
+            f,
+            &ui::RenderCtx {
+                app,
+                host_short: remote.short_host(),
+            },
+            map,
+        )
+    })?;
+    app.status = None;
+    Ok(())
+}
+
+fn exec_delete(
+    app: &mut App,
+    remote: &Remote,
+    cfg: &mut Config,
+    terminal: &mut Term,
+    map: &mut MouseMap,
+    names: Vec<String>,
+) -> Result<()> {
+    app.cancel_prompt();
+    draw_status(terminal, app, remote, map, &format!("Deleting {}…", names.len()))?;
+    let running: Vec<String> = names
+        .iter()
+        .filter(|n| app.sessions.iter().any(|s| &s.name == *n && s.running))
+        .cloned()
+        .collect();
+    remote.kill_sessions(&running);
+    for n in &names {
+        cfg.remove(n);
+    }
+    let _ = cfg.save();
+    app.clear_picked();
+    refresh(app, remote, cfg);
+    Ok(())
+}
+
+fn exec_rename(app: &mut App, remote: &Remote, cfg: &mut Config, old: String, new: String) {
+    app.cancel_prompt();
+    if new.is_empty() || new == old {
+        return;
+    }
+    if let Some((running, dir)) = app
+        .sessions
+        .iter()
+        .find(|s| s.name == old)
+        .map(|s| (s.running, s.dir.clone()))
+    {
+        if running {
+            remote.rename_session(&old, &new);
+        }
+        cfg.remove(&old);
+        cfg.upsert(&new, &dir);
+        let _ = cfg.save();
+    }
+    refresh(app, remote, cfg);
+}
+
+fn exec_move(app: &mut App, remote: &Remote, cfg: &mut Config, names: Vec<String>, target: String) {
+    app.cancel_prompt();
+    if target.trim().is_empty() {
+        return;
+    }
+    for old in &names {
+        let new_name = app::moved_name(old, &target);
+        if new_name == *old {
+            continue; // already in that project
+        }
+        if let Some((running, dir)) = app
+            .sessions
+            .iter()
+            .find(|s| &s.name == old)
+            .map(|s| (s.running, s.dir.clone()))
+        {
+            if running {
+                // Pure relabel — tmux session name is unrelated to
+                // pane_current_path, so the remote dir is untouched.
+                remote.rename_session(old, &new_name);
+            }
+            cfg.remove(old);
+            cfg.upsert(&new_name, &dir);
+        }
+    }
+    let _ = cfg.save();
+    app.clear_picked();
+    refresh(app, remote, cfg);
+}
+
+/// Route a keypress to the active modal prompt. Enter confirms, Esc cancels.
+fn handle_prompt_key(app: &mut App, key: KeyEvent) -> Outcome {
+    // Ctrl-C always aborts the whole app.
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Outcome::Quit;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            app.cancel_prompt();
+            Outcome::None
+        }
+        KeyCode::Enter => match app.prompt.clone() {
+            Prompt::ConfirmDelete { names } => Outcome::ExecDelete { names },
+            Prompt::Rename { old, buffer } => Outcome::ExecRename {
+                old,
+                new: buffer.trim().to_string(),
+            },
+            Prompt::MoveTo { names, .. } => match app.move_selected_project() {
+                Some(target) => Outcome::ExecMove { names, target },
+                None => {
+                    app.cancel_prompt();
+                    Outcome::None
+                }
+            },
+            Prompt::NewSession { buffer } => {
+                let name = buffer.trim().to_string();
+                if name.is_empty() {
+                    app.cancel_prompt();
+                    Outcome::None
+                } else {
+                    app.cancel_prompt();
+                    Outcome::NewSessionNamed { name }
+                }
+            }
+            Prompt::None => Outcome::None,
+        },
+        // Confirm dialogs also accept y / n directly.
+        KeyCode::Char('y') | KeyCode::Char('Y')
+            if matches!(app.prompt, Prompt::ConfirmDelete { .. }) =>
+        {
+            if let Prompt::ConfirmDelete { names } = app.prompt.clone() {
+                Outcome::ExecDelete { names }
+            } else {
+                Outcome::None
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Char('N')
+            if matches!(app.prompt, Prompt::ConfirmDelete { .. }) =>
+        {
+            app.cancel_prompt();
+            Outcome::None
+        }
+        // In the move picker, up/down cycle the target project.
+        KeyCode::Up => {
+            app.move_prev();
+            Outcome::None
+        }
+        KeyCode::Down => {
+            app.move_next();
+            Outcome::None
+        }
+        KeyCode::Backspace => {
+            app.prompt_backspace();
+            Outcome::None
+        }
+        KeyCode::Char(c) => {
+            app.prompt_push(c);
+            Outcome::None
+        }
+        _ => Outcome::None,
     }
 }
 
@@ -162,9 +362,11 @@ fn handle_mouse(app: &mut App, m: MouseEvent, map: &MouseMap) -> Outcome {
             // Action bar takes priority (it sits below the table).
             if let Some(action) = map.hit_action(m.column, m.row) {
                 app.action = action;
-                // Clicking "delete N" while sessions are picked fires the bulk
-                // delete immediately (matches the keyboard flow).
-                if action == Action::Delete && !app.picked.is_empty() {
+                // Clicking "delete N" / "move N" while sessions are picked
+                // fires the bulk action immediately (matches the keyboard flow).
+                if !app.picked.is_empty()
+                    && matches!(action, Action::Delete | Action::Move)
+                {
                     return decide_action(app);
                 }
                 return Outcome::None;
@@ -230,7 +432,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Outcome {
     }
 }
 
-/// Resolve the current action against the cursor into a concrete Outcome.
+/// Resolve the current action against the cursor. Attach hands off to ssh;
+/// rename/move/delete/new open an in-TUI modal (returning `Outcome::None` —
+/// the modal drives the rest).
 fn decide_action(app: &mut App) -> Outcome {
     // After acting, action resets to Attach (matches zsh).
     let action = app.action;
@@ -239,7 +443,8 @@ fn decide_action(app: &mut App) -> Outcome {
     match action {
         Action::Attach => {
             if app.on_new() {
-                Outcome::NewSession
+                app.open_new_session();
+                Outcome::None
             } else if app.current_running() {
                 match app.current_name() {
                     Some(name) => Outcome::Attach(SessionAction::Attach { name }),
@@ -264,112 +469,40 @@ fn decide_action(app: &mut App) -> Outcome {
             if app.on_new() {
                 return Outcome::None;
             }
-            match app.current_name() {
-                Some(old) => Outcome::Rename { old },
-                None => Outcome::None,
+            if let Some(old) = app.current_name() {
+                app.open_rename(old);
             }
+            Outcome::None
+        }
+        Action::Move => {
+            // Bulk move when sessions are picked; else the cursor session.
+            let names = if !app.picked.is_empty() {
+                app.picked_names()
+            } else if app.on_new() {
+                return Outcome::None;
+            } else {
+                match app.current_name() {
+                    Some(name) => vec![name],
+                    None => return Outcome::None,
+                }
+            };
+            app.open_move(names);
+            Outcome::None
         }
         Action::Delete => {
-            if !app.picked.is_empty() {
-                return Outcome::BulkDelete {
-                    names: app.picked_names(),
-                };
-            }
-            if app.on_new() {
+            let names = if !app.picked.is_empty() {
+                app.picked_names()
+            } else if app.on_new() {
                 return Outcome::None;
-            }
-            match app.current_name() {
-                Some(name) => Outcome::Delete { name },
-                None => Outcome::None,
-            }
-        }
-    }
-}
-
-/// Perform an interactive outcome outside the alternate screen. Returns
-/// Ok(true) if the program should exit afterwards (attach detaches → exit).
-fn perform(outcome: Outcome, app: &mut App, remote: &Remote, cfg: &mut Config) -> Result<bool> {
-    match outcome {
-        Outcome::NewSession => {
-            print!("\r\n  \x1b[36mSession name (project/name):\x1b[0m ");
-            io::stdout().flush().ok();
-            if let Some(name) = read_line()? {
-                let name = name.trim().to_string();
-                if !name.is_empty() {
-                    cfg.upsert(&name, "");
-                    let _ = cfg.save();
-                    remote.run_interactive(SessionAction::New { name })?;
-                    return Ok(true);
+            } else {
+                match app.current_name() {
+                    Some(name) => vec![name],
+                    None => return Outcome::None,
                 }
-            }
-            Ok(false)
+            };
+            app.open_confirm_delete(names);
+            Outcome::None
         }
-        Outcome::Attach(action) => {
-            remote.run_interactive(action)?;
-            Ok(true)
-        }
-        Outcome::Rename { old } => {
-            print!("\r\n  \x1b[36mNew name for \x1b[35m{old}\x1b[36m:\x1b[0m ");
-            io::stdout().flush().ok();
-            if let Some(new_name) = read_line()? {
-                let new_name = new_name.trim().to_string();
-                if !new_name.is_empty() {
-                    let old_info = app
-                        .sessions
-                        .iter()
-                        .find(|s| s.name == old)
-                        .map(|s| (s.running, s.dir.clone()));
-                    if let Some((running, dir)) = old_info {
-                        if running {
-                            remote.rename_session(&old, &new_name);
-                        }
-                        cfg.remove(&old);
-                        cfg.upsert(&new_name, &dir);
-                        let _ = cfg.save();
-                    }
-                    refresh(app, remote, cfg);
-                }
-            }
-            Ok(false)
-        }
-        Outcome::Delete { name } => {
-            print!("\r\n  \x1b[36mDelete \x1b[35m{name}\x1b[36m? (y/n):\x1b[0m ");
-            io::stdout().flush().ok();
-            if confirm_yes()? {
-                if let Some(s) = app.sessions.iter().find(|s| s.name == name) {
-                    if s.running {
-                        remote.kill_session(&name);
-                    }
-                }
-                cfg.remove(&name);
-                let _ = cfg.save();
-                refresh(app, remote, cfg);
-            }
-            Ok(false)
-        }
-        Outcome::BulkDelete { names } => {
-            print!(
-                "\r\n  \x1b[36mDelete \x1b[35m{}\x1b[36m selected session(s)? (y/n):\x1b[0m ",
-                names.len()
-            );
-            io::stdout().flush().ok();
-            if confirm_yes()? {
-                let running: Vec<String> = names
-                    .iter()
-                    .filter(|n| app.sessions.iter().any(|s| &s.name == *n && s.running))
-                    .cloned()
-                    .collect();
-                remote.kill_sessions(&running);
-                for n in &names {
-                    cfg.remove(n);
-                }
-                let _ = cfg.save();
-                app.clear_picked();
-                refresh(app, remote, cfg);
-            }
-            Ok(false)
-        }
-        Outcome::Quit | Outcome::None => Ok(false),
     }
 }
 
@@ -384,7 +517,7 @@ fn refresh(app: &mut App, remote: &Remote, cfg: &mut Config) {
     }
 }
 
-// --- Terminal suspend / resume around interactive shell-outs ---
+// --- Terminal suspend (handing off to ssh) ---
 
 fn suspend(terminal: &mut Term) -> Result<()> {
     disable_raw_mode()?;
@@ -395,32 +528,4 @@ fn suspend(terminal: &mut Term) -> Result<()> {
     )?;
     terminal.show_cursor()?;
     Ok(())
-}
-
-fn resume(terminal: &mut Term) -> Result<()> {
-    enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-    terminal.clear()?;
-    terminal.hide_cursor()?;
-    Ok(())
-}
-
-// --- Cooked-mode line/confirm input (used while suspended) ---
-
-fn read_line() -> Result<Option<String>> {
-    let mut line = String::new();
-    let n = io::stdin().read_line(&mut line)?;
-    if n == 0 {
-        Ok(None)
-    } else {
-        Ok(Some(line))
-    }
-}
-
-fn confirm_yes() -> Result<bool> {
-    // We're in cooked mode here; read one line and check its first char.
-    match read_line()? {
-        Some(s) => Ok(s.trim_start().starts_with('y')),
-        None => Ok(false),
-    }
 }
